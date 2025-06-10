@@ -48,7 +48,7 @@ if __name__ == "__main__":
             enforce_eager=True,
             block_size=16,
             enable_prefix_caching=False,
-            gpu_memory_utilization=0.5)
+            gpu_memory_utilization=0.8)
     ttft_list = []
     seq_len_list = []
     for i, prompt in enumerate(prompts):

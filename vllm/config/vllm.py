@@ -994,6 +994,12 @@ class VllmConfig:
             self.kv_transfer_config.kv_connector_extra_config.update(
                 {"cpu_bytes_to_use": kv_offloading_size * (1 << 30)}
             )
+        elif kv_offloading_backend == "radixshmem":
+            # node-wide, not per rank: every DP rank maps this one pool
+            self.kv_transfer_config.kv_connector = "RadixShmemConnector"
+            self.kv_transfer_config.kv_connector_extra_config.setdefault(
+                "cpu_bytes_to_use", int(kv_offloading_size * (1 << 30))
+            )
         elif kv_offloading_backend == "lmcache":
             # Default to LMCache multi-process (MP) mode. The actual KV
             # storage capacity is managed by the standalone LMCache server

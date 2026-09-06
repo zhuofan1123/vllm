@@ -15,9 +15,10 @@ any scheduler exists (``initialize_from_config`` runs while the engine core is
 still sizing the KV cache), so attaching eagerly would deadlock against the
 owner that has not been created yet.
 
-Every DP rank must run with the same ``PYTHONHASHSEED``. vLLM seeds ``NONE_HASH``
--- the root of every ``BlockHash`` chain -- from ``os.urandom(32)`` when it is
-unset, so each scheduler process would hash identical tokens differently and no
+Every DP rank must derive the same ``NONE_HASH`` -- the root of every
+``BlockHash`` chain. With ``--prefix-caching-hash-algo sha256`` vLLM uses a fixed
+seed; with xxhash it seeds from ``os.urandom(32)`` unless ``PYTHONHASHSEED`` is
+set, so each scheduler process would hash identical tokens differently and no
 prefix could ever be shared. The owner publishes its fingerprint in the sentinel
 and the other schedulers refuse to attach on a mismatch.
 
@@ -32,6 +33,7 @@ Limits: ``PP=1``, one node, ``reset_prefix_cache`` does not clear the shared
 index, and the instance has to be restarted if the owner process dies.
 """
 
+import os
 from collections.abc import Iterable
 from typing import Any
 
@@ -77,7 +79,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.radixshmem.worker import (
 )
 from vllm.forward_context import ForwardContext
 from vllm.logger import init_logger
-from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
+from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -87,21 +89,37 @@ from vllm.v1.request import Request
 logger = init_logger(__name__)
 
 
+def _warn_if_block_hashes_are_per_process(vllm_config: VllmConfig) -> None:
+    """vLLM seeds NONE_HASH from os.urandom for xxhash unless PYTHONHASHSEED is set.
+
+    Checked from config rather than from ``kv_cache_utils.NONE_HASH`` because the
+    connector is built before ``init_none_hash`` runs in the engine core.
+    """
+    hash_algo = vllm_config.cache_config.prefix_caching_hash_algo
+    if hash_algo.startswith("xxhash") and os.getenv("PYTHONHASHSEED") is None:
+        logger.warning(
+            "RadixShmem: --prefix-caching-hash-algo %s is not collision resistant, "
+            "so with PYTHONHASHSEED unset vLLM seeds NONE_HASH from os.urandom and "
+            "every DP scheduler hashes the same tokens differently -- nothing can "
+            "be shared between ranks. Set PYTHONHASHSEED to the same fixed value "
+            "in every process, or use --prefix-caching-hash-algo sha256.",
+            hash_algo,
+        )
+
+
 class RadixShmemConnector(KVConnectorBase_V1):
     @property
-    def prefer_cross_layer_blocks(self) -> bool:
-        # one tensor per block instead of one per layer means one contiguous
-        # run per slot slice, which is far fewer batch-copy descriptors
-        return True
+    def requires_kv_delivery(self) -> bool:
+        # a best-effort cache: a dropped store is only a future miss
+        return False
 
     def __init__(
         self,
         vllm_config: VllmConfig,
         role: KVConnectorRole,
-        kv_cache_config: KVCacheConfig | None = None,
+        kv_cache_config: KVCacheConfig,
     ):
         super().__init__(vllm_config, role, kv_cache_config)
-        assert kv_cache_config is not None
         assert vllm_config.kv_transfer_config is not None
         extra = vllm_config.kv_transfer_config.kv_connector_extra_config
 
@@ -120,6 +138,7 @@ class RadixShmemConnector(KVConnectorBase_V1):
             # would make every engine try to own the region.
             dp_rank = vllm_config.parallel_config.data_parallel_index
             if dp_rank == 0:
+                _warn_if_block_hashes_are_per_process(vllm_config)
                 regions = create_regions(
                     self.geometry,
                     extra,
@@ -161,12 +180,6 @@ class RadixShmemConnector(KVConnectorBase_V1):
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         assert self.connector_worker is not None
         self.connector_worker.register_kv_caches(kv_caches)
-
-    def register_cross_layers_kv_cache(
-        self, kv_cache: torch.Tensor, attn_backend: type[AttentionBackend]
-    ):
-        assert self.connector_worker is not None
-        self.connector_worker.register_cross_layers_kv_cache(kv_cache, attn_backend)
 
     def handle_preemptions(self, kv_connector_metadata: KVConnectorMetadata):
         assert self.connector_worker is not None

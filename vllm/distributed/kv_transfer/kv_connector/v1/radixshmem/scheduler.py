@@ -34,14 +34,15 @@ from vllm.distributed.kv_transfer.kv_connector.v1.radixshmem.metadata import (
     RadixShmemWorkerMetadata,
     ReqId,
     StoreJob,
+    TransferSpec,
 )
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.kv_offload.mediums import CPULoadStoreSpec, GPULoadStoreSpec
+from vllm.v1.kv_offload.base import GPULoadStoreSpec
+from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 from vllm.v1.kv_offload.radixshmem.manager import LookupLease, RadixShmemManager, to_u64
-from vllm.v1.kv_offload.worker.worker import TransferSpec
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 
@@ -248,14 +249,14 @@ class RadixShmemConnectorScheduler:
             src_block_ids: list[int] = []
             for offloaded_idx in range(store_start, num_blocks):
                 base = offloaded_idx * self.block_size_factor
-                src_block_ids.extend(
-                    block_ids[base : base + self.block_size_factor]
-                )
+                src_block_ids.extend(block_ids[base : base + self.block_size_factor])
             assert len(src_block_ids) == num_new * self.block_size_factor
 
             dst_spec = CPULoadStoreSpec(slots.tolist())
             src_spec = GPULoadStoreSpec(
-                src_block_ids, group_sizes=(len(src_block_ids),)
+                src_block_ids,
+                group_sizes=(len(src_block_ids),),
+                block_indices=(store_start * self.block_size_factor,),
             )
 
             store_id = self._next_store_id
@@ -273,7 +274,9 @@ class RadixShmemConnectorScheduler:
                 req_id=req_id,
             )
             self._store_ids_by_req[req_id].add(store_id)
-            stores.append(StoreJob(store_id=store_id, req_id=req_id, spec=(src_spec, dst_spec)))
+            stores.append(
+                StoreJob(store_id=store_id, req_id=req_id, spec=(src_spec, dst_spec))
+            )
             self._next_stored_block_idx[req_id] = num_blocks
 
             logger.debug(

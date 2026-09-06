@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """The scheduler-side RadixShmem ledger, against a real shared index."""
 
+import contextlib
 import os
 
 import numpy as np
@@ -21,10 +22,8 @@ NUM_SLOTS = 64
 @pytest.fixture
 def manager(request):
     name = f"/rs_mgr_{os.getpid()}_{abs(hash(request.node.name)) % 10**6}"
-    try:
+    with contextlib.suppress(OSError):
         os.unlink(f"/dev/shm{name}")
-    except OSError:
-        pass
     cfg = shmradix.ShmConfig()
     cfg.max_nodes = 4 * NUM_SLOTS + 1024
     cfg.max_blocks = NUM_SLOTS
@@ -35,10 +34,8 @@ def manager(request):
     yield m
     m.close()
     del client, server
-    try:
+    with contextlib.suppress(OSError):
         os.unlink(f"/dev/shm{name}")
-    except OSError:
-        pass
 
 
 def hashes(*ids: int) -> np.ndarray:

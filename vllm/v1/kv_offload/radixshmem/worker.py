@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Worker-side GPU <-> SlotStore transfers for the RadixShmem connector.
 
-Unlike ``CpuGpuOffloadingHandlers``, nothing is allocated here: the CPU side is
-one node-wide shared region created by the DP rank 0 scheduler, and this worker
-only attaches to it, pins its TP slice of every slot, and DMAs in and out.
+Unlike ``CPUOffloadingWorker``, nothing is allocated here: the CPU side is one
+node-wide shared region created by the DP rank 0 scheduler, and this worker only
+attaches to it, pins its TP slice of every slot, and DMAs in and out.
 
 The slot layout is packed, so a slot is not a contiguous run of pages the way a
 ``swap_blocks`` destination is::
@@ -21,25 +21,28 @@ import time
 from collections import deque
 from dataclasses import dataclass
 
-import numpy as np
 import torch
 
 from vllm.logger import init_logger
-from vllm.v1.kv_offload.mediums import BlockIDsLoadStoreSpec
-from vllm.v1.kv_offload.spec import CanonicalKVCaches
-from vllm.v1.kv_offload.worker.radixshmem_mem import (
+from vllm.v1.kv_offload.base import (
+    BlockIDsLoadStoreSpec,
+    CanonicalKVCaches,
+    GPULoadStoreSpec,
+    LoadStoreSpec,
+    OffloadingWorker,
+    TransferResult,
+)
+from vllm.v1.kv_offload.radixshmem.mem import (
     PackedSlotAddresser,
     copy_addrs,
     host_register,
     host_unregister,
 )
-from vllm.v1.kv_offload.worker.worker import (
-    OffloadingHandler,
-    TransferResult,
-    TransferSpec,
-)
 
 logger = init_logger(__name__)
+
+# (src, dst) pair handed to a handler; one of the two is always the GPU side.
+TransferSpec = tuple[LoadStoreSpec, LoadStoreSpec]
 
 
 @dataclass
@@ -51,18 +54,17 @@ class _Transfer:
     num_bytes: int
 
 
-class SlotTransferHandler(OffloadingHandler):
+class SlotTransferHandler:
     """One direction of GPU <-> SlotStore traffic, submitted in order.
 
-    Mirrors ``SingleDirectionOffloadingHandler``: a stream per in-flight job,
-    each chained to the previous job's end event so completion order matches
-    submission order.
+    Mirrors ``SingleDirectionOffloadingHandler`` in ``kv_offload/cpu``: a stream
+    per in-flight job, each chained to the previous job's end event so
+    completion order matches submission order.
     """
 
     def __init__(self, addresser: PackedSlotAddresser, *, gpu_to_cpu: bool):
         self.addresser = addresser
         self.gpu_to_cpu = gpu_to_cpu
-        self.transfer_type = ("GPU", "CPU") if gpu_to_cpu else ("CPU", "GPU")
 
         self._transfer_events: dict[int, torch.Event] = {}
         self._transfers: deque[_Transfer] = deque()
@@ -128,7 +130,6 @@ class SlotTransferHandler(OffloadingHandler):
                     success=True,
                     transfer_size=t.num_bytes,
                     transfer_time=t.start_event.elapsed_time(t.end_event) * 1e-3,
-                    transfer_type=self.transfer_type,
                 )
             )
             self._stream_pool.append(t.stream)
@@ -150,8 +151,13 @@ class SlotTransferHandler(OffloadingHandler):
         self.get_finished()
 
 
-class RadixShmemOffloadingHandlers:
-    """Attaches the shared SlotStore and builds both direction handlers."""
+class RadixShmemOffloadingHandlers(OffloadingWorker):
+    """Attaches the shared SlotStore and drives both transfer directions.
+
+    This is the ``OffloadingWorker`` for the RadixShmem medium: ``submit_store``
+    is GPU -> slot, ``submit_load`` is slot -> GPU. The two directions are
+    independent handlers so a burst of stores never queues behind a load.
+    """
 
     def __init__(
         self,
@@ -222,6 +228,33 @@ class RadixShmemOffloadingHandlers:
             geometry.total_data_bytes / 2**30,
             self.host_register_s,
         )
+
+    # ------------------------------------------------------ OffloadingWorker
+
+    def submit_store(
+        self, job_id: int, src_spec: GPULoadStoreSpec, dst_spec: LoadStoreSpec
+    ) -> bool:
+        return self.gpu_to_cpu_handler.transfer_async(job_id, (src_spec, dst_spec))
+
+    def submit_load(
+        self, job_id: int, src_spec: LoadStoreSpec, dst_spec: GPULoadStoreSpec
+    ) -> bool:
+        return self.cpu_to_gpu_handler.transfer_async(job_id, (src_spec, dst_spec))
+
+    def get_finished(self) -> list[TransferResult]:
+        return (
+            self.gpu_to_cpu_handler.get_finished()
+            + self.cpu_to_gpu_handler.get_finished()
+        )
+
+    def wait(self, job_ids: set[int]) -> None:
+        self.gpu_to_cpu_handler.wait(job_ids)
+        self.cpu_to_gpu_handler.wait(job_ids)
+
+    def shutdown(self) -> None:
+        self.close()
+
+    # ------------------------------------------------------------- teardown
 
     def close(self) -> None:
         """Drain, unpin, detach -- in that order.

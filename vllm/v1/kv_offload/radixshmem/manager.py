@@ -105,6 +105,14 @@ class RadixShmemManager:
 
     # ------------------------------------------------------------ lookup
 
+    @staticmethod
+    def _hit_blocks(result) -> int:
+        """``common_hit`` of a Full-only query, or 0 when the request failed."""
+        status = getattr(result, "status", None)
+        if status is not None and int(status) != 0:
+            return 0
+        return int(result.common_hit)
+
     def lookup(self, hashes: np.ndarray) -> int:
         """Blocks of ``hashes`` (root-anchored) already in the shared cache."""
         if hashes.size == 0:
@@ -113,7 +121,7 @@ class RadixShmemManager:
         r = self.client.query(hashes, local_only=True, lock=False, update_meta=False)
         self.time_query_s += time.perf_counter() - t0
         self.num_queries += 1
-        return int(r.local_hit_length)
+        return self._hit_blocks(r)
 
     def lookup_and_pin(self, hashes: np.ndarray) -> LookupLease | None:
         """Match from the root and pin the hit in one shot.
@@ -129,13 +137,23 @@ class RadixShmemManager:
         r = self.client.query(hashes, local_only=True, lock=True, update_meta=True)
         self.time_query_s += time.perf_counter() - t0
         self.num_queries += 1
-        hit = int(r.local_hit_length)
+        hit = self._hit_blocks(r)
         if hit == 0:
             # lock=True with a zero hit takes no ref, but finalize is still a
             # valid one-shot; call it so nothing is left dangling.
             r.finalize()
             return None
-        slots = np.ascontiguousarray(r.prefix_slots[:hit], dtype=np.int32)
+        # Full slots come back as (source_rank, offset, slot_ids) runs tiling
+        # [0, common_hit) in offset order; local_only gives at most one run.
+        runs = [np.asarray(ids, dtype=np.int32) for _, _, ids in r.full_fragments]
+        slots = np.concatenate(runs) if len(runs) > 1 else runs[0]
+        if slots.size < hit:
+            r.finalize()
+            raise RuntimeError(
+                f"RadixShmem: query hit {hit} blocks but returned "
+                f"{slots.size} Full slots"
+            )
+        slots = np.ascontiguousarray(slots[:hit], dtype=np.int32)
         self.num_hit_blocks += hit
         lease = LookupLease(hit, slots, r.finalize, self)
         self._leases.add(lease)

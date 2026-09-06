@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.v1.kv_cache_interface import KVCacheConfig
-    from vllm.v1.kv_offload.spec import CanonicalKVCaches
+    from vllm.v1.kv_offload.base import CanonicalKVCaches
 
 DEFAULT_INDEX_SHM_NAME = "/vllm_kv_index"
 DEFAULT_DATA_SHM_NAME = "/vllm_kv_data"
@@ -86,8 +86,7 @@ class SlotGeometry:
         raise GeometryMismatch(
             "RadixShmem geometry mismatch between this process and "
             f"{what}; every process attaching the same shared region must "
-            "derive an identical geometry. Differing fields:\n  "
-            + "\n  ".join(diffs)
+            "derive an identical geometry. Differing fields:\n  " + "\n  ".join(diffs)
         )
 
 

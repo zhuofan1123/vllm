@@ -19,6 +19,7 @@ The sentinel is what makes the handshake safe:
 """
 
 import atexit
+import contextlib
 import json
 import os
 import time
@@ -67,10 +68,8 @@ def _region_file(name: str, hugepage_path: str) -> str:
 
 
 def _unlink_quiet(path: str) -> None:
-    try:
+    with contextlib.suppress(OSError):
         os.unlink(path)
-    except OSError:
-        pass
 
 
 @dataclass
@@ -176,14 +175,6 @@ def create_regions(
     _write_sentinel(sentinel, geometry)
     atexit.register(regions.close)
 
-    if os.getenv("PYTHONHASHSEED") is None:
-        logger.warning(
-            "RadixShmem: PYTHONHASHSEED is not set, so vLLM seeds NONE_HASH from "
-            "os.urandom and every DP scheduler hashes the same tokens "
-            "differently -- nothing can be shared between ranks. Set it to the "
-            "same fixed value in every process."
-        )
-
     logger.info(
         "RadixShmem owner ready: index=%s (max_blocks=%d, max_nodes=%d, "
         "block_size=%d) data=%s (%d slots x %d B stride = %.2f GiB, "
@@ -267,8 +258,7 @@ def _check_attached(geometry: SlotGeometry, client: Any, store: Any) -> None:
     """Cross-check the two regions against each other and the geometry."""
     if store.num_slots != geometry.num_slots:
         raise GeometryMismatch(
-            f"SlotStore has {store.num_slots} slots, geometry says "
-            f"{geometry.num_slots}"
+            f"SlotStore has {store.num_slots} slots, geometry says {geometry.num_slots}"
         )
     if store.slot_bytes != geometry.slot_stride:
         raise GeometryMismatch(
@@ -301,10 +291,10 @@ def _check_attached(geometry: SlotGeometry, client: Any, store: Any) -> None:
 def none_hash_fingerprint() -> str | None:
     """vLLM's ``NONE_HASH``, the root every BlockHash chain hangs off.
 
-    ``init_none_hash`` seeds it from ``os.urandom`` when ``PYTHONHASHSEED`` is
-    unset, so two DP schedulers then hash identical tokens to different
-    BlockHashes -- the shared tree silently degenerates into one private subtree
-    per rank. Returns None before the engine has initialized it.
+    ``init_none_hash`` seeds it from ``os.urandom`` for xxhash when
+    ``PYTHONHASHSEED`` is unset, so two DP schedulers then hash identical tokens
+    to different BlockHashes -- the shared tree silently degenerates into one
+    private subtree per rank. Returns None before the engine has initialized it.
     """
     from vllm.v1.core import kv_cache_utils
 
@@ -321,9 +311,9 @@ def check_none_hash(published: str | None, *, what: str) -> None:
         "RadixShmem: this process derives a different vLLM NONE_HASH than "
         f"{what} ({local[:16]}... vs {published[:16]}...), so identical tokens "
         "would hash to different BlockHashes and no prefix could ever be shared "
-        "between DP ranks. NONE_HASH is randomized per process unless "
-        "PYTHONHASHSEED is set -- set it to the same fixed value in every "
-        "process that attaches this region."
+        "between DP ranks. With xxhash NONE_HASH is randomized per process "
+        "unless PYTHONHASHSEED is set -- set it to the same fixed value in every "
+        "process that attaches this region, or use sha256."
     )
 
 

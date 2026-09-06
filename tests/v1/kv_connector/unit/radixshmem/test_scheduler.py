@@ -105,9 +105,7 @@ def fake_blocks(block_ids: list[int], num_computed: int):
         SimpleNamespace(block_hash=(b"h" if i < num_computed else None))
         for i in range(len(block_ids))
     ]
-    return SimpleNamespace(
-        blocks=[blocks], get_block_ids=lambda: [list(block_ids)]
-    )
+    return SimpleNamespace(blocks=[blocks], get_block_ids=lambda: [list(block_ids)])
 
 
 def fake_output(entries, preempted=None):
@@ -231,9 +229,7 @@ def test_unallocated_pin_is_swept(sched):
 def test_publish_waits_for_every_tp_rank(sched):
     req = fake_request("a", 2)
     sched.update_state_after_alloc(req, fake_blocks([0, 1], 0), 0)
-    meta = sched.build_connector_meta(
-        fake_output([("a", [0, 1], 2 * GPU_BLOCK_SIZE)])
-    )
+    meta = sched.build_connector_meta(fake_output([("a", [0, 1], 2 * GPU_BLOCK_SIZE)]))
     store_id = meta.stores[0].store_id
     assert sched.world_size == 2
 

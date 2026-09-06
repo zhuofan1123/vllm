@@ -181,9 +181,7 @@ def test_owner_publishes_and_attacher_reads(tmp_path):
         slot = regions.store.read_slot(3)
         assert slot[: g.tp_slice_bytes] == b"\xaa" * g.tp_slice_bytes
         # the other TP slice was never written
-        assert slot[g.tp_slice_bytes :] == b"\x00" * (
-            g.slot_stride - g.tp_slice_bytes
-        )
+        assert slot[g.tp_slice_bytes :] == b"\x00" * (g.slot_stride - g.tp_slice_bytes)
 
         # attacher writes the TP1 slice; owner-side memory is the same memory
         mv = regions.store.slot_view(3)

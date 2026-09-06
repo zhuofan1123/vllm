@@ -19,16 +19,18 @@ from vllm.distributed.kv_transfer.kv_connector.v1.radixshmem import (
     compute_geometry,
     create_regions,
 )
-from vllm.v1.kv_offload.mediums import CPULoadStoreSpec, GPULoadStoreSpec
-from vllm.v1.kv_offload.spec import CanonicalKVCacheRef, CanonicalKVCaches
-from vllm.v1.kv_offload.spec import CanonicalKVCacheTensor as Tensor
-from vllm.v1.kv_offload.worker.radixshmem import RadixShmemOffloadingHandlers
+from vllm.v1.kv_offload.base import (
+    CanonicalKVCacheRef,
+    CanonicalKVCaches,
+    GPULoadStoreSpec,
+)
+from vllm.v1.kv_offload.base import CanonicalKVCacheTensor as Tensor
+from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
+from vllm.v1.kv_offload.radixshmem.worker import RadixShmemOffloadingHandlers
 
 pytest.importorskip("shmradix")
 pytest.importorskip("shmradix._data")
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="needs a GPU"
-)
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
 GPU_BLOCK_SIZE = 16
 PAGE_BYTES = 2048
@@ -84,7 +86,9 @@ def make_kv_caches():
 
 
 def run(handler, gpu_block_ids, slot_ids, *, gpu_to_cpu):
-    gpu = GPULoadStoreSpec(gpu_block_ids, group_sizes=(len(gpu_block_ids),))
+    gpu = GPULoadStoreSpec(
+        gpu_block_ids, group_sizes=(len(gpu_block_ids),), block_indices=(0,)
+    )
     cpu = CPULoadStoreSpec(slot_ids)
     spec = (gpu, cpu) if gpu_to_cpu else (cpu, gpu)
     assert handler.transfer_async(0, spec)
@@ -209,7 +213,9 @@ def test_queued_transfers_complete_in_submission_order(rig):
         t[0].fill_(1)
         t[1].fill_(2)
 
-    gpu = lambda ids: GPULoadStoreSpec(ids, group_sizes=(len(ids),))  # noqa: E731
+    gpu = lambda ids: GPULoadStoreSpec(  # noqa: E731
+        ids, group_sizes=(len(ids),), block_indices=(0,)
+    )
     assert h.transfer_async(0, (gpu([0]), CPULoadStoreSpec([1])))
     assert h.transfer_async(1, (gpu([1]), CPULoadStoreSpec([2])))
     for t in rig.gpu_tensors[0]:
@@ -230,5 +236,8 @@ def test_queued_transfers_complete_in_submission_order(rig):
 
 def test_empty_transfer_is_rejected(rig):
     h = rig.handlers[0].gpu_to_cpu_handler
-    spec = (GPULoadStoreSpec([], group_sizes=(0,)), CPULoadStoreSpec([]))
+    spec = (
+        GPULoadStoreSpec([], group_sizes=(0,), block_indices=(0,)),
+        CPULoadStoreSpec([]),
+    )
     assert h.transfer_async(0, spec) is False

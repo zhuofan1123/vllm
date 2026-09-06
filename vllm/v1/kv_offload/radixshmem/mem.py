@@ -15,19 +15,23 @@ Host address of GPU sub-block ``j`` of canonical tensor ``t`` in slot ``s``:
 """
 
 import ctypes
+from typing import Any
 
 import numpy as np
 import torch
 
 from vllm.logger import init_logger
 from vllm.v1.simple_kv_offload.cuda_mem_ops import (
+    CU_MEMCPY_SRC_ACCESS_ORDER_ANY,
     _CUmemcpyAttributes,
     _resolve_batch_memcpy,
+    _resolve_max_batch_descriptors,
 )
 
 logger = init_logger(__name__)
 
-_batch_memcpy_fn = None
+# Resolved lazily on first use: (entry point, numAttrs to pass).
+_batch_memcpy: tuple[Any, int] | None = None
 
 
 def host_register(ptr: int, nbytes: int) -> None:
@@ -52,32 +56,41 @@ def copy_addrs(
     sizes: np.ndarray,
     stream: torch.cuda.Stream,
 ) -> None:
-    """Submit an arbitrary-address batch copy on ``stream``."""
-    global _batch_memcpy_fn
+    """Submit an arbitrary-address batch copy on ``stream``.
+
+    All three arrays must be contiguous uint64 of the same length. Chunked to
+    the platform's descriptor ceiling (only ROCm caps it; CUDA issues one call).
+    """
+    global _batch_memcpy
     n = src_addrs.size
     if n == 0:
         return
-    if _batch_memcpy_fn is None:
-        _batch_memcpy_fn = _resolve_batch_memcpy()
+    if _batch_memcpy is None:
+        _batch_memcpy = _resolve_batch_memcpy()
+    fn, num_attrs = _batch_memcpy
 
-    attrs = _CUmemcpyAttributes(srcAccessOrder=3)  # ANY
+    attrs = _CUmemcpyAttributes(srcAccessOrder=CU_MEMCPY_SRC_ACCESS_ORDER_ANY)
     attrs_idx = ctypes.c_size_t(0)
     fail_idx = ctypes.c_size_t(0)
-    err = _batch_memcpy_fn(
-        dst_addrs.ctypes.data,
-        src_addrs.ctypes.data,
-        sizes.ctypes.data,
-        n,
-        ctypes.addressof(attrs),
-        ctypes.byref(attrs_idx),
-        1,
-        ctypes.byref(fail_idx),
-        stream.cuda_stream,
-    )
-    if err != 0:
-        raise RuntimeError(
-            f"cuMemcpyBatchAsync failed: err={err} failIdx={fail_idx.value}"
+    max_desc = _resolve_max_batch_descriptors()
+    step = n if max_desc <= 0 else max_desc
+    for off in range(0, n, step):
+        cnt = min(step, n - off)
+        err = fn(
+            dst_addrs[off : off + cnt].ctypes.data,
+            src_addrs[off : off + cnt].ctypes.data,
+            sizes[off : off + cnt].ctypes.data,
+            cnt,
+            ctypes.addressof(attrs),
+            ctypes.byref(attrs_idx),
+            num_attrs,
+            ctypes.byref(fail_idx),
+            stream.cuda_stream,
         )
+        if err != 0:
+            raise RuntimeError(
+                f"batch memcpy failed: err={err} failIdx={fail_idx.value}"
+            )
 
 
 class PackedSlotAddresser:
@@ -127,7 +140,7 @@ class PackedSlotAddresser:
         ``gpu_block_ids`` is at GPU-block granularity, ``slot_ids`` at offloaded
         (slot) granularity. When the two do not line up exactly, the leading
         ``(-len(gpu_block_ids)) % factor`` sub-blocks of the first slot are
-        skipped -- matching ``cpu_gpu.SingleDirectionOffloadingHandler``.
+        skipped -- matching ``kv_offload/cpu``'s ``SingleDirectionOffloadingHandler``.
         """
         factor = self.block_size_factor
         gpu_block_ids = np.ascontiguousarray(gpu_block_ids, dtype=np.uint64)

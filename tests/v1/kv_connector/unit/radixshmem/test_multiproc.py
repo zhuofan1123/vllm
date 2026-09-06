@@ -12,7 +12,6 @@ import multiprocessing as mp
 import os
 import signal
 import time
-from types import SimpleNamespace
 
 import pytest
 
@@ -125,9 +124,7 @@ def _crash_proc(tag, ready, err_q):
     """Create the regions, signal ready, then hang until killed."""
     try:
         sched, _ = _build(tag, owner=True, dp_rank=0)
-        store_and_ack(
-            sched, fake_request("c", 2, salt=7), [0, 1], 2 * GPU_BLOCK_SIZE
-        )
+        store_and_ack(sched, fake_request("c", 2, salt=7), [0, 1], 2 * GPU_BLOCK_SIZE)
         ready.put(sched.regions.owner_pid)
         time.sleep(600)
     except BaseException as exc:  # noqa: BLE001
@@ -154,9 +151,10 @@ def test_new_owner_reclaims_after_the_old_one_is_killed():
         sched, _ = _build(tag, owner=True, dp_rank=0)
         try:
             # reclaimed, not reused: the killed owner's entries are gone
-            assert sched.manager.lookup(
-                sched._prefix_u64(fake_request("c", 2, salt=7), 2)
-            ) == 0
+            assert (
+                sched.manager.lookup(sched._prefix_u64(fake_request("c", 2, salt=7), 2))
+                == 0
+            )
             assert sched.manager.client.mempool_used() == 0
         finally:
             sched.close()

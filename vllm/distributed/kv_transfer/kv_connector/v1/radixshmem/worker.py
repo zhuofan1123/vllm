@@ -29,6 +29,7 @@ import torch
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     OffloadingConnectorStats,
+    _TransferMetricName,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import (
     OffloadingConnectorWorker,
@@ -37,13 +38,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.radixshmem.metadata import (
     RadixShmemMetadata,
     RadixShmemWorkerMetadata,
     ReqId,
+    TransferSpec,
 )
 from vllm.logger import init_logger
-from vllm.v1.attention.backend import AttentionBackend
-from vllm.v1.kv_offload.mediums import CPULoadStoreSpec, GPULoadStoreSpec
-from vllm.v1.kv_offload.spec import CanonicalKVCaches
-from vllm.v1.kv_offload.worker.radixshmem import RadixShmemOffloadingHandlers
-from vllm.v1.kv_offload.worker.worker import OffloadingWorker, TransferSpec
+from vllm.v1.kv_offload.base import CanonicalKVCaches, GPULoadStoreSpec
+from vllm.v1.kv_offload.radixshmem.worker import RadixShmemOffloadingHandlers
 
 logger = init_logger(__name__)
 
@@ -51,8 +50,7 @@ logger = init_logger(__name__)
 class RadixShmemConnectorWorker:
     def __init__(self, *, attach: Callable[[], tuple], vllm_config, kv_cache_config):
         self._attach = attach
-        self.worker = OffloadingWorker()
-        self.handlers: RadixShmemOffloadingHandlers | None = None
+        self.worker: RadixShmemOffloadingHandlers | None = None
         self._kv_caches: CanonicalKVCaches | None = None
         self._attach_lock = threading.Lock()
         self._attach_thread: threading.Thread | None = None
@@ -74,17 +72,10 @@ class RadixShmemConnectorWorker:
 
     # -------------------------------------------------- KV cache registration
 
-    def register_kv_caches(
-        self, kv_caches: dict[str, torch.Tensor | list[torch.Tensor]]
-    ):
+    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         self._canonicalizer.register_kv_caches(kv_caches)
 
-    def register_cross_layers_kv_cache(
-        self, kv_cache: torch.Tensor, attn_backend: type[AttentionBackend]
-    ):
-        self._canonicalizer.register_cross_layers_kv_cache(kv_cache, attn_backend)
-
-    def _register_handlers(self, kv_caches: CanonicalKVCaches):
+    def _on_canonical_kv_caches(self, kv_caches: CanonicalKVCaches):
         assert self._kv_caches is None, "KV caches registered twice"
         self._kv_caches = kv_caches
         self._start_attach()
@@ -117,26 +108,19 @@ class RadixShmemConnectorWorker:
 
     def _attach_now(self) -> None:
         with self._attach_lock:
-            if self.handlers is not None:
+            if self.worker is not None:
                 return
             assert self._kv_caches is not None, "transfer before register_kv_caches"
             regions, tp_rank = self._attach()
-            handlers = RadixShmemOffloadingHandlers(
+            # published last: worker is what _ensure_attached checks
+            self.worker = RadixShmemOffloadingHandlers(
                 regions=regions, kv_caches=self._kv_caches, tp_rank=tp_rank
             )
-            self.worker.register_handler(
-                GPULoadStoreSpec, CPULoadStoreSpec, handlers.gpu_to_cpu_handler
-            )
-            self.worker.register_handler(
-                CPULoadStoreSpec, GPULoadStoreSpec, handlers.cpu_to_gpu_handler
-            )
-            # published last: handlers is what _ensure_attached checks
-            self.handlers = handlers
 
-    def _ensure_attached(self) -> None:
+    def _ensure_attached(self) -> RadixShmemOffloadingHandlers:
         """Join the background attach; do it here if it never started."""
-        if self.handlers is not None:
-            return
+        if self.worker is not None:
+            return self.worker
         t0 = time.perf_counter()
         if self._attach_thread is not None:
             self._attach_thread.join()
@@ -149,6 +133,8 @@ class RadixShmemConnectorWorker:
                 "RadixShmem worker attach blocked the first transfer for %.3f s",
                 waited,
             )
+        assert self.worker is not None
+        return self.worker
 
     # ------------------------------------------------------------- transfers
 
@@ -157,12 +143,21 @@ class RadixShmemConnectorWorker:
         self._job_counter = job_id + 1
         return job_id
 
+    def _submit(self, job_id: int, spec: TransferSpec) -> None:
+        worker = self._ensure_attached()
+        src_spec, dst_spec = spec
+        if isinstance(src_spec, GPULoadStoreSpec):
+            ok = worker.submit_store(job_id, src_spec, dst_spec)
+        else:
+            assert isinstance(dst_spec, GPULoadStoreSpec)
+            ok = worker.submit_load(job_id, src_spec, dst_spec)
+        assert ok, f"RadixShmem: transfer job {job_id} was rejected"
+
     def _submit_deferred_stores(self) -> None:
         if not self._unsubmitted_store_jobs:
             return
-        self._ensure_attached()
         for job_id, spec in self._unsubmitted_store_jobs:
-            assert self.worker.transfer_async(job_id, spec)
+            self._submit(job_id, spec)
         self._unsubmitted_store_jobs.clear()
 
     def handle_preemptions(self, metadata: RadixShmemMetadata):
@@ -171,18 +166,16 @@ class RadixShmemConnectorWorker:
             job_ids = self._store_jobs.get(req_id)
             if job_ids:
                 # the GPU blocks are about to be reused, so the reads must land
-                self.worker.wait(job_ids)
+                self._ensure_attached().wait(job_ids)
 
     def start_kv_transfers(self, metadata: RadixShmemMetadata):
         self._submit_deferred_stores()
-        if metadata.reqs_to_load:
-            self._ensure_attached()
         for req_id, spec in metadata.reqs_to_load.items():
             job_id = self._generate_job_id()
             self._jobs[job_id] = (req_id, None)
             assert req_id not in self._load_job
             self._load_job[req_id] = job_id
-            assert self.worker.transfer_async(job_id, spec)
+            self._submit(job_id, spec)
 
     def prepare_store_kv(self, metadata: RadixShmemMetadata):
         for store in metadata.stores:
@@ -192,38 +185,52 @@ class RadixShmemConnectorWorker:
             # deferred to the next step so offloading never delays sampling
             self._unsubmitted_store_jobs.append((job_id, store.spec))
 
+    def _record_transfer(self, *, store: bool, num_bytes: int, seconds: float) -> None:
+        if store:
+            bytes_name = _TransferMetricName.STORE_BYTES
+            time_name = _TransferMetricName.STORE_TIME
+            size_name = _TransferMetricName.STORE_SIZE
+        else:
+            bytes_name = _TransferMetricName.LOAD_BYTES
+            time_name = _TransferMetricName.LOAD_TIME
+            size_name = _TransferMetricName.LOAD_SIZE
+        stats = self.kv_connector_stats
+        stats.increase_counter(bytes_name, num_bytes)
+        stats.increase_counter(time_name, seconds)
+        stats.observe_histogram(size_name, num_bytes)
+
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         finished_sending: set[str] = set()
         finished_recving: set[str] = set()
-        for result in self.worker.get_finished():
-            assert result.success
-            req_id, store_id = self._jobs.pop(result.job_id)
-            if (
-                result.transfer_time
-                and result.transfer_size is not None
-                and result.transfer_type is not None
-            ):
-                self.kv_connector_stats.record_transfer(
-                    num_bytes=result.transfer_size,
-                    time=result.transfer_time,
-                    transfer_type=result.transfer_type,
-                )
-            if store_id is not None:
-                # tell the scheduler this rank's slice of those slots is written
-                self._completed_stores[store_id] = (
-                    self._completed_stores.get(store_id, 0) + 1
-                )
-                req_jobs = self._store_jobs[req_id]
-                req_jobs.discard(result.job_id)
-                if req_jobs:
-                    continue
-                if req_id in self._finished_reqs_waiting_for_store:
-                    self._finished_reqs_waiting_for_store.remove(req_id)
-                    finished_sending.add(req_id)
-                    del self._store_jobs[req_id]
-            else:
-                assert self._load_job.pop(req_id) == result.job_id
-                finished_recving.add(req_id)
+        if self.worker is not None:
+            for result in self.worker.get_finished():
+                assert result.success
+                req_id, store_id = self._jobs.pop(result.job_id)
+                if (
+                    result.transfer_time is not None
+                    and result.transfer_size is not None
+                ):
+                    self._record_transfer(
+                        store=store_id is not None,
+                        num_bytes=result.transfer_size,
+                        seconds=result.transfer_time,
+                    )
+                if store_id is not None:
+                    # tell the scheduler this rank's slice of those slots is written
+                    self._completed_stores[store_id] = (
+                        self._completed_stores.get(store_id, 0) + 1
+                    )
+                    req_jobs = self._store_jobs[req_id]
+                    req_jobs.discard(result.job_id)
+                    if req_jobs:
+                        continue
+                    if req_id in self._finished_reqs_waiting_for_store:
+                        self._finished_reqs_waiting_for_store.remove(req_id)
+                        finished_sending.add(req_id)
+                        del self._store_jobs[req_id]
+                else:
+                    assert self._load_job.pop(req_id) == result.job_id
+                    finished_recving.add(req_id)
 
         for req_id in finished_req_ids:
             pending = self._store_jobs.get(req_id)
@@ -261,9 +268,9 @@ class RadixShmemConnectorWorker:
                 logger.warning("RadixShmem: attach still running at close; leaving it")
                 return
             self._attach_thread = None
-        if self.handlers is not None:
-            self.handlers.close()
-            self.handlers = None
+        if self.worker is not None:
+            self.worker.close()
+            self.worker = None
         self._kv_caches = None
 
 
@@ -273,22 +280,15 @@ class _Canonicalizer(OffloadingConnectorWorker):
     That class derives the canonical (num_blocks, page_bytes) views from every
     supported attention backend layout -- a lot of backend-specific reasoning
     with no RadixShmem content. Subclassing and overriding the one hook it
-    exposes is cheaper and safer than copying it.
+    calls at the end (``_init_worker``) is cheaper and safer than copying it.
     """
 
     def __init__(self, vllm_config, kv_cache_config, owner: RadixShmemConnectorWorker):
-        # deliberately not calling super().__init__: only the two register_*
-        # methods are used, and they need just these two attributes
-        self.spec = _SpecShim(vllm_config, kv_cache_config)
-        self._owner = owner
-
-    def _register_handlers(self, kv_caches: CanonicalKVCaches):
-        self._owner._register_handlers(kv_caches)
-
-
-class _SpecShim:
-    """The subset of ``OffloadingSpec`` the canonicalization actually reads."""
-
-    def __init__(self, vllm_config, kv_cache_config):
+        # deliberately not calling super().__init__: only register_kv_caches is
+        # used, and it reads just these two attributes before _init_worker
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
+        self._owner = owner
+
+    def _init_worker(self, kv_caches: CanonicalKVCaches) -> None:
+        self._owner._on_canonical_kv_caches(kv_caches)

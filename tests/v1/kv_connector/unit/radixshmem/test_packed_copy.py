@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 import torch
 
-from vllm.v1.kv_offload.worker.radixshmem_mem import PackedSlotAddresser
+from vllm.v1.kv_offload.radixshmem.mem import PackedSlotAddresser
 
 shmradix_data = pytest.importorskip("shmradix._data")
 
@@ -119,7 +119,7 @@ def test_no_overlap_across_ranks_tensors_and_slots():
 def test_roundtrip_gpu_cpu_gpu(tp_rank):
     import os
 
-    from vllm.v1.kv_offload.worker.radixshmem_mem import (
+    from vllm.v1.kv_offload.radixshmem.mem import (
         copy_addrs,
         host_register,
         host_unregister,
@@ -217,7 +217,7 @@ def test_load_skip_roundtrip():
     """A partial first slot: the skipped sub-block must stay untouched on GPU."""
     import os
 
-    from vllm.v1.kv_offload.worker.radixshmem_mem import (
+    from vllm.v1.kv_offload.radixshmem.mem import (
         copy_addrs,
         host_register,
         host_unregister,

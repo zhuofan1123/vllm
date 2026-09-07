@@ -69,18 +69,24 @@ def sentinel_path(geometry: SlotGeometry, sentinel_dir: str) -> str:
 
 
 def _pid_alive(pid: int) -> bool:
-    return pid > 0 and os.path.exists(f"/proc/{pid}")
+    return pid > 0 and _proc_start_time(pid) is not None
 
 
 def _proc_start_time(pid: int) -> int | None:
-    """Kernel start time (clock ticks) of ``pid``; None if it is gone."""
+    """Kernel start time (clock ticks) of ``pid``, or None if it is gone or a
+    zombie. A defunct (state ``Z``) owner still has a ``/proc`` entry but is
+    dead: its region and sentinel are stale and a new owner must replace them.
+    """
     try:
         with open(f"/proc/{pid}/stat") as f:
             stat = f.read()
     except OSError:
         return None
-    # field 22, counted after the ")" that ends the (possibly spaced) comm
+    # fields after the ")" that ends the (possibly spaced) comm: state is [0],
+    # start time is field 22 -> [19]
     fields = stat[stat.rindex(")") + 2 :].split()
+    if fields[0] == "Z":
+        return None
     return int(fields[19])
 
 

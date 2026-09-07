@@ -291,22 +291,39 @@ def test_swa_publish_waits_for_the_full_path(manager):
 
 
 @pytest.mark.parametrize("regions", [HYBRID], indirect=True)
-def test_swa_slot_is_published_only_when_every_sub_chunk_landed(manager):
+def test_swa_slot_publishes_on_the_offered_window_parts(manager):
+    """A windowed group offers only its reachable window; the merged SWA slot
+    publishes once those offered sub-chunks land (not every theoretical one),
+    and the whole position then hits."""
     hashes = block_hashes(4)
     ctx = req_context("a", hashes)
     full_keys, swa_keys = hybrid_keys(hashes)
     store(manager, ctx, full_keys)
-    # only the second half of position 1 arrives (chunk 3 without chunk 2)
-    out = manager.prepare_store([swa_keys[3]], ctx)
+    # the connector stores position 1's window: both its sub-chunks (2, 3)
+    out = manager.prepare_store(swa_keys[2:4], ctx)
+    probe = req_context("probe", hashes)
+    assert manager.lookup(swa_keys[2], probe) is LookupResult.MISS  # not landed
+    manager.on_schedule_end(STEP)
     manager.complete_store(out.keys_to_store, ctx)
     b = req_context("b", hashes)
-    assert manager.lookup(swa_keys[3], b) is LookupResult.MISS
+    assert lookups(manager, b, swa_keys[2:4]) == [LookupResult.HIT] * 2
     manager.on_schedule_end(STEP)
-    # the other half completes the slot; both chunks are now a hit
-    out = manager.prepare_store([swa_keys[2]], ctx)
-    assert list(out.store_spec.block_ids) == [] or len(out.store_spec.block_ids) == 1
-    manager.complete_store(out.keys_to_store, ctx)
-    assert lookups(manager, b, swa_keys[2:]) == [LookupResult.HIT] * 2
+
+
+@pytest.mark.parametrize("regions", [HYBRID], indirect=True)
+def test_swa_slot_does_not_stall_on_unoffered_sub_chunks(manager):
+    """The connector offering only part of a position's span must still publish
+    -- requiring every theoretical sub-chunk would never complete for a
+    windowed group that only keeps a trailing window (DeepSeek-V4)."""
+    hashes = block_hashes(4)
+    ctx = req_context("a", hashes)
+    full_keys, swa_keys = hybrid_keys(hashes)
+    store(manager, ctx, full_keys)
+    # only the tail sub-chunk of position 1 is offered
+    store(manager, ctx, [swa_keys[3]])
+    assert not manager._pending  # published, nothing stuck
+    b = req_context("b", hashes)
+    assert manager.lookup(swa_keys[3], b) is LookupResult.HIT
     manager.on_schedule_end(STEP)
 
 

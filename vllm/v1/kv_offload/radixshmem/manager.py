@@ -503,8 +503,13 @@ class _PendingSlot:
     slot: int
     path: np.ndarray  # root-anchored path with len >= position + 1
     # (group, sub-chunk) parts still to be written into the slot
-    parts_left: set[tuple[int, int]]
+    # (group, sub-chunk) parts the connector offered for this slot and has not
+    # yet confirmed stored. Populated from the actual store keys, not a fixed
+    # theoretical set: a windowed group only offers its reachable window, so
+    # requiring every sub-chunk would never complete (DeepSeek-V4).
+    parts_left: set[tuple[int, int]] = field(default_factory=set)
     keys: list[OffloadKey] = field(default_factory=list)
+    landed_any: bool = False
     retries: int = 0
 
 
@@ -525,16 +530,6 @@ class RadixShmemOffloadingManager(OffloadingManager):
         full = [g for g in geometry.groups if g.kind == PoolKind.FULL]
         self._full_groups = frozenset(g.group_idx for g in full)
         self._full_hashes_per_chunk = full[0].hashes_per_chunk
-        # parts one slot of each pool is made of: (group, sub-chunk) pairs
-        self._slot_parts: dict[int, frozenset[tuple[int, int]]] = {
-            kind: frozenset(
-                (g.group_idx, sub)
-                for g in geometry.groups
-                if g.kind == kind
-                for sub in range(g.ratio)
-            )
-            for kind in (PoolKind.FULL, PoolKind.SWA, PoolKind.MAMBA)
-        }
         self._states: dict[str, _ReqState] = {}
         # requests that pinned something this step and may need a sweep
         self._dirty: set[str] = set()
@@ -752,9 +747,11 @@ class RadixShmemOffloadingManager(OffloadingManager):
                     position=position,
                     slot=int(slots[0]),
                     path=state.path,
-                    parts_left=set(self._slot_parts[group.kind]),
                 )
                 self._pending[pending_key] = pending
+            # track exactly what the connector offers; a windowed group's slot
+            # merges every windowed group's window at this position
+            pending.parts_left.add((group.group_idx, sub))
             pending.keys.append(key)
             keys_to_store.append(key)
             # one CPU slot per (group, position): the connector's handler
@@ -789,6 +786,7 @@ class RadixShmemOffloadingManager(OffloadingManager):
             if pending is None:
                 continue
             pending.parts_left.discard((group.group_idx, sub))
+            pending.landed_any = True
             if not pending.parts_left and pending not in completed:
                 completed.append(pending)
                 del self._pending[(req_id, group.kind, position)]

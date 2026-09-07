@@ -170,6 +170,7 @@ class RadixShmemOffloadingSpec(OffloadingSpec):
                 sentinel_dir=self._sentinel_dir,
                 timeout_s=self._attach_timeout_s,
                 role=f"tp{rank} worker ({self.config.engine_id[:8]})",
+                adopt_published=True,
             )
             return regions, rank
 

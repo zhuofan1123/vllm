@@ -315,6 +315,45 @@ def test_hybrid_pools_are_created_and_attached(request):
         owner.close()
 
 
+def test_workers_adopt_the_published_geometry(request):
+    """A worker's byte counts may differ from the scheduler's (projected KV
+    cache config); it must adopt the owner's layout, but never a different
+    deployment's."""
+    from dataclasses import replace
+
+    tag = unique_tag(request)
+    config = make_offloading_config(tag=tag, tp_size=2, groups=hybrid_groups())
+    owner_geometry = compute_geometry(config)
+    owner = create_regions(owner_geometry, dict(config.extra_config))
+    try:
+        # same deployment, bigger per-group byte counts on the worker side
+        inflated = replace(
+            config,
+            groups=tuple(
+                replace(g, worker_kv_bytes_per_block=g.worker_kv_bytes_per_block * 2)
+                for g in config.groups
+            ),
+        )
+        mine = compute_geometry(inflated)
+        assert mine != owner_geometry
+        with pytest.raises(GeometryMismatch):
+            attach_regions(mine, timeout_s=5, role="tp1")
+        regions = attach_regions(mine, timeout_s=5, role="tp1", adopt_published=True)
+        try:
+            assert regions.geometry == owner_geometry
+        finally:
+            regions.close()
+
+        # a different deployment is still rejected
+        other = compute_geometry(
+            replace(config, parallel=replace(config.parallel, tp_size=1, world_size=1))
+        )
+        with pytest.raises(GeometryMismatch, match="tp_size"):
+            attach_regions(other, timeout_s=5, role="tp1", adopt_published=True)
+    finally:
+        owner.close()
+
+
 def test_attach_geometry_mismatch_fails_closed(request):
     tag = unique_tag(request)
     p, done, _ = _spawn_owner(tag)

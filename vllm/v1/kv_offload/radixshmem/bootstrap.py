@@ -342,11 +342,16 @@ def attach_regions(
     timeout_s: float = DEFAULT_ATTACH_TIMEOUT_S,
     role: str = "attacher",
     check_block_hashes: bool = False,
+    adopt_published: bool = False,
 ) -> SharedRegions:
     """Non-owner path: wait for the sentinel, attach, verify.
 
     ``check_block_hashes`` is for schedulers: only they compute BlockHashes, so
     only they can disagree with the owner about what a prefix hashes to.
+    ``adopt_published`` is for workers: they see a worker-projected KV cache
+    config, so instead of matching the owner's geometry byte for byte they
+    check it is compatible and use the published one (the returned regions
+    carry it).
     """
     shmradix, shmradix_data = _import_shmradix()
 
@@ -356,7 +361,11 @@ def attach_regions(
     published, owner_pid, owner_start, owner_none_hash = _wait_for_sentinel(
         sentinel, deadline, role
     )
-    geometry.check_same(published, what="the region owner")
+    if adopt_published:
+        geometry.check_compatible(published, what="the region owner")
+        geometry = published
+    else:
+        geometry.check_same(published, what="the region owner")
     if check_block_hashes:
         check_none_hash(owner_none_hash, what="the region owner")
 

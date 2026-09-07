@@ -179,6 +179,54 @@ class SlotGeometry:
         d["pools"] = tuple(PoolSpec(**p) for p in d["pools"])
         return cls(**d)
 
+    # fields a process can derive identically from its own config even when it
+    # sees a projected KV cache config (workers do): everything but byte counts
+    _COMPATIBILITY_FIELDS = (
+        "index_shm_name",
+        "data_shm_name",
+        "hugepage_path",
+        "tokens_per_chunk",
+        "blocks_per_chunk",
+        "tp_size",
+        "replicated",
+        "slot_align",
+        "model_fingerprint",
+    )
+
+    def check_compatible(self, published: "SlotGeometry", *, what: str) -> None:
+        """Fail closed unless ``published`` describes the same deployment.
+
+        Workers see the KV cache config after worker-side projection (kernel
+        block splitting, padded pages), so their recomputed byte counts need
+        not equal the scheduler's; they adopt the published geometry instead
+        and only the structural fields must agree.
+        """
+        mine, theirs = self.to_dict(), published.to_dict()
+        diffs = [
+            f"{k}: mine={mine[k]!r} theirs={theirs.get(k)!r}"
+            for k in self._COMPATIBILITY_FIELDS
+            if mine[k] != theirs.get(k)
+        ]
+        if self.pool_mask != published.pool_mask:
+            diffs.append(
+                f"pools: mine={self.pool_mask:#x} theirs={published.pool_mask:#x}"
+            )
+        for a, b in zip(self.groups, published.groups):
+            for k in ("group_idx", "kind", "tokens_per_chunk", "ratio"):
+                if getattr(a, k) != getattr(b, k):
+                    diffs.append(
+                        f"group {a.group_idx} {k}: mine={getattr(a, k)!r} "
+                        f"theirs={getattr(b, k)!r}"
+                    )
+        if len(self.groups) != len(published.groups):
+            diffs.append(
+                f"groups: mine={len(self.groups)} theirs={len(published.groups)}"
+            )
+        if diffs:
+            raise GeometryMismatch(
+                f"RadixShmem geometry is incompatible with {what}: " + "; ".join(diffs)
+            )
+
     def check_same(self, other: "SlotGeometry", *, what: str) -> None:
         """Fail closed if any field differs from what ``what`` published."""
         mine = self.to_dict()
@@ -375,8 +423,10 @@ def compute_geometry(config: "OffloadingConfig") -> SlotGeometry:
             )
         )
 
+    # name + KV dtype only: the KV layout string is resolved on workers but not
+    # on schedulers, and the byte layout is checked separately anyway
     fingerprint = hashlib.sha256(
-        f"{config.model.name}|{config.model.dtype}|{config.kv_cache_layout}".encode()
+        f"{config.model.name}|{config.model.dtype}".encode()
     ).hexdigest()[:16]
 
     return SlotGeometry(

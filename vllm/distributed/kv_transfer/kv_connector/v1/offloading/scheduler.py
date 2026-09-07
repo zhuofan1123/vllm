@@ -33,11 +33,11 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.single_type_kv_cache_manager import SingleTypeKVCacheManager
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
-    FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
     MambaSpec,
     SlidingWindowSpec,
+    is_full_attention_spec,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.kv_offload.base import (
@@ -121,7 +121,11 @@ def get_sliding_window_size_in_chunks(
         # Mamba depends on a single state
         return 1
 
-    assert isinstance(kv_cache_spec, FullAttentionSpec)
+    # A UniformTypeKVCacheSpecs group (e.g. DeepSeek-V4's packed MLA layers)
+    # is full attention when every layer it wraps is.
+    assert is_full_attention_spec(kv_cache_spec), (
+        f"Unsupported KV cache spec for offloading: {type(kv_cache_spec).__name__}"
+    )
     return None
 
 

@@ -145,3 +145,14 @@ def keys_for(hashes: list[bytes], group_idx: int = 0, hashes_per_chunk: int = 1)
         make_offload_key(hashes[(i + 1) * hashes_per_chunk - 1], group_idx)
         for i in range(n)
     ]
+
+
+def dsv4_like_groups() -> list[OffloadingGroupConfig]:
+    """DeepSeek-V4 shaped multi-granularity hybrid: a 128-token full-attention
+    group over two windowed groups of different block sizes (64 and 16 tokens),
+    so their slots span 2 and 8 GPU blocks of one full position."""
+    return [
+        group(128, kind="full", bytes_per_block=4 * PAGE_BYTES, name="mla"),
+        group(64, kind="swa", window=128, bytes_per_block=PAGE_BYTES, name="swa"),
+        group(16, kind="swa", window=64, bytes_per_block=PAGE_BYTES // 2, name="csa"),
+    ]

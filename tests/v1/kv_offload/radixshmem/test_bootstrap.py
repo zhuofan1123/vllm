@@ -41,7 +41,7 @@ def test_geometry_math():
     assert g.blocks_per_chunk == 1 and g.tokens_per_chunk == 16
     [full] = g.pools
     assert full.kind == PoolKind.FULL
-    assert full.sub_blocks == 1
+    assert g.groups[0].sub_blocks == 1
     assert full.slice_bytes == PAGE_BYTES * NUM_LAYERS
     assert full.num_slices == 2
     assert full.slot_bytes == PAGE_BYTES * NUM_LAYERS * 2
@@ -57,7 +57,7 @@ def test_geometry_blocks_per_chunk():
     )
     full = g.require_pool(PoolKind.FULL)
     assert g.blocks_per_chunk == 4 and g.tokens_per_chunk == 64
-    assert full.sub_blocks == 4
+    assert g.groups[0].sub_blocks == 4
     assert full.slice_bytes == PAGE_BYTES * NUM_LAYERS * 4
     assert full.slot_bytes == full.slice_bytes * 4
 
@@ -72,13 +72,13 @@ def test_geometry_hybrid_pools():
     assert (full.kind, swa.kind) == (PoolKind.FULL, PoolKind.SWA)
     assert g.groups[1].ratio == 2 and g.groups[1].hashes_per_chunk == 1
     assert g.groups[0].ratio == 1 and g.groups[0].hashes_per_chunk == 2
-    assert swa.sub_blocks == 2  # two 16-token SWA blocks per 32-token position
+    assert g.groups[1].sub_blocks == 2  # two 16-token SWA blocks per position
     assert swa.slice_bytes == PAGE_BYTES * 2
     assert full.slice_bytes == 2 * PAGE_BYTES
     assert g.swa_window_blocks == 1  # 32-token window == one FULL position
     assert g.pool_mask == PoolKind.FULL.mask | PoolKind.SWA.mask
-    # pools without an explicit count get the FULL pool's count, all in budget
-    assert swa.num_slots == full.num_slots
+    # both pools sized from the same budget by their default shares (0.70 / 0.25)
+    assert full.num_slots > swa.num_slots > 0
     assert g.total_data_bytes <= 8 << 20
 
 

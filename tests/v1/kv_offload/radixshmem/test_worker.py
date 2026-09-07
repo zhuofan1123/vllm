@@ -22,8 +22,8 @@ from vllm.v1.kv_offload.radixshmem.bootstrap import attach_regions, create_regio
 from vllm.v1.kv_offload.radixshmem.geometry import PoolKind
 from vllm.v1.kv_offload.radixshmem.worker import (
     RadixShmemOffloadingWorker,
-    plan_pools,
-    pool_views,
+    group_cpu_views,
+    plan_groups,
 )
 
 from .utils import geometry_for, group, make_offloading_config, unique_tag
@@ -173,12 +173,12 @@ def rig(request):
     r.close()
 
 
-def test_pool_views_address_this_ranks_slice(rig):
+def test_group_views_address_this_ranks_region(rig):
     g = rig.geometry
     full = g.require_pool(PoolKind.FULL)
     _, caches = make_kv_caches()
-    [plan] = plan_pools(g, caches)
-    base, views = pool_views(rig.owner, plan, writer_idx=1)
+    [plan] = plan_groups(g, caches)
+    base, views = group_cpu_views(rig.owner, plan, writer_idx=1)
     assert len(views) == 2
     for t, v in enumerate(views):
         assert v.shape == (full.num_slots, PAGE_BYTES)
@@ -304,7 +304,7 @@ def test_hybrid_job_splits_across_full_and_swa_pools(request, packed):
     r = Rig(request, config, make_caches)
     try:
         g = r.geometry
-        assert g.require_pool(PoolKind.SWA).sub_blocks == 2
+        assert [gr.sub_blocks for gr in g.groups if gr.kind == PoolKind.SWA] == [2]
         w = r.workers[0]
         if packed:
             block = r.gpu[0]

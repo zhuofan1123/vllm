@@ -9,9 +9,13 @@ tensors. The transfers themselves are upstream's
 ``SingleDirectionOffloadingHandler`` -- batch copies over the same address
 arithmetic the private CPU pool uses, so there is no RadixShmem copy path.
 
-The store has one pool per attention kind (see ``geometry.py``), so there is
-one pair of handlers per pool and a connector job is split by KV cache group
-before submission; the parent job completes when every part has.
+The store has one pool per attention kind (see ``geometry.py``), and inside a
+pool every KV cache group owns its own byte region of each slot -- a group's
+region holds its ``sub_blocks`` GPU blocks of one full-attention position, and
+groups of one pool may differ in ``sub_blocks`` (DeepSeek-V4's windowed groups
+span 4 / 32 / 64 blocks). So there is one pair of handlers *per group*, and a
+connector job is split by group before submission; the parent job completes
+when every part has.
 
 Attaching is deferred to a background thread started at construction, joined by
 the first transfer. Workers are built during ``initialize_from_config``, before
@@ -23,7 +27,7 @@ that creates the regions; doing it inline on the first transfer instead costs
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import torch
 
@@ -42,17 +46,17 @@ from vllm.v1.kv_offload.cpu.gpu_worker import SingleDirectionOffloadingHandler
 
 from .bootstrap import SharedRegions
 from .geometry import (
+    GroupLayout,
     PoolKind,
-    PoolSpec,
     SlotGeometry,
-    tensor_layout,
-    verify_pool_layout,
+    group_tensor_layout,
+    verify_group_layout,
 )
 
 logger = init_logger(__name__)
 
-# a parent job id j fans out to child ids j * _CHILD_STRIDE + kind
-_CHILD_STRIDE = 8
+# a parent job id j fans out to child ids j * _CHILD_STRIDE + group_idx
+_CHILD_STRIDE = 64
 
 
 def host_register(ptr: int, nbytes: int) -> None:
@@ -72,22 +76,22 @@ def host_unregister(ptr: int) -> None:
 
 
 @dataclass
-class PoolPlan:
-    """GPU tensors and per-group refs that go through one pool's handlers."""
+class _GroupTensors:
+    """GPU tensors and canonical refs for one KV cache group."""
 
-    pool: PoolSpec
-    gpu_tensors: list[torch.Tensor] = field(default_factory=list)
-    # per KV cache group (all groups; empty for groups of other pools)
-    refs_per_group: list[list[CanonicalKVCacheRef]] = field(default_factory=list)
-    group_idxs: list[int] = field(default_factory=list)
+    group: GroupLayout
+    gpu_tensors: list[torch.Tensor]
+    refs: list[CanonicalKVCacheRef]  # into gpu_tensors, in layer order
 
     @property
     def page_bytes(self) -> list[int]:
         return [t.shape[1] for t in self.gpu_tensors]
 
 
-def plan_pools(geometry: SlotGeometry, kv_caches: CanonicalKVCaches) -> list[PoolPlan]:
-    """Split the canonical KV caches by pool.
+def plan_groups(
+    geometry: SlotGeometry, kv_caches: CanonicalKVCaches
+) -> list[_GroupTensors]:
+    """Split the canonical KV caches into per-group GPU tensors.
 
     Layer-outermost layouts already come as one canonical tensor per layer (or
     per set of aliased layers); each group's refs pick its tensors. Packed
@@ -95,7 +99,6 @@ def plan_pools(geometry: SlotGeometry, kv_caches: CanonicalKVCaches) -> list[Poo
     the whole block for every group, so per-layer strided views are carved out
     of it using the layer offsets the geometry carries.
     """
-    num_groups = len(geometry.groups)
     packed = (
         len(kv_caches.tensors) == 1
         and any(g.layer_pages for g in geometry.groups)
@@ -104,64 +107,64 @@ def plan_pools(geometry: SlotGeometry, kv_caches: CanonicalKVCaches) -> list[Poo
             for refs in kv_caches.group_data_refs
         )
     )
-    plans: dict[int, PoolPlan] = {
-        p.kind: PoolPlan(pool=p, refs_per_group=[[] for _ in range(num_groups)])
-        for p in geometry.pools
-    }
+    plans: list[_GroupTensors] = []
     if packed:
         packed_tensor = kv_caches.tensors[0].tensor
         block_stride = kv_caches.tensors[0].page_size_bytes
         base = packed_tensor.view(torch.int8).view((-1, block_stride))
         num_blocks = base.shape[0]
         for group in geometry.groups:
-            plan = plans[group.kind]
+            tensors: list[torch.Tensor] = []
+            refs: list[CanonicalKVCacheRef] = []
             for offset, page in group.layer_pages:
                 if offset + page > block_stride:
                     raise RuntimeError(
                         f"layer page [{offset}, {offset + page}) exceeds the packed "
                         f"block of {block_stride} bytes"
                     )
-                view = torch.as_strided(
-                    base, (num_blocks, page), (block_stride, 1), storage_offset=offset
+                tensors.append(
+                    torch.as_strided(
+                        base,
+                        (num_blocks, page),
+                        (block_stride, 1),
+                        storage_offset=offset,
+                    )
                 )
-                plan.gpu_tensors.append(view)
-                plan.refs_per_group[group.group_idx].append(
-                    CanonicalKVCacheRef(len(plan.gpu_tensors) - 1, page)
-                )
-            plan.group_idxs.append(group.group_idx)
-        return [plans[p.kind] for p in geometry.pools]
+                refs.append(CanonicalKVCacheRef(len(tensors) - 1, page))
+            plans.append(_GroupTensors(group, tensors, refs))
+        return plans
 
     for group in geometry.groups:
-        plan = plans[group.kind]
+        tensors = []
+        refs = []
         local_idx: dict[int, int] = {}
         for ref in kv_caches.group_data_refs[group.group_idx]:
             if ref.tensor_idx not in local_idx:
                 t = kv_caches.tensors[ref.tensor_idx]
-                plan.gpu_tensors.append(
-                    t.tensor.view(torch.int8).view((-1, t.page_size_bytes))
-                )
-                local_idx[ref.tensor_idx] = len(plan.gpu_tensors) - 1
-            plan.refs_per_group[group.group_idx].append(
+                tensors.append(t.tensor.view(torch.int8).view((-1, t.page_size_bytes)))
+                local_idx[ref.tensor_idx] = len(tensors) - 1
+            refs.append(
                 CanonicalKVCacheRef(local_idx[ref.tensor_idx], ref.page_size_bytes)
             )
-        plan.group_idxs.append(group.group_idx)
-    return [plans[p.kind] for p in geometry.pools]
+        plans.append(_GroupTensors(group, tensors, refs))
+    return plans
 
 
-def pool_views(
-    regions: SharedRegions, plan: PoolPlan, writer_idx: int
+def group_cpu_views(
+    regions: SharedRegions, plan: _GroupTensors, writer_idx: int
 ) -> tuple[torch.Tensor, list[torch.Tensor]]:
-    """Strided per-tensor views of this writer's slice of every slot of a pool.
+    """Strided per-tensor views of this writer's region of a group's pool.
 
     Returns the flat int8 tensor over the pool (keep it alive: the views borrow
-    its storage) and, per GPU tensor ``t`` of the plan, an int8 view of shape
+    its storage) and, per GPU tensor ``t`` of the group, an int8 view of shape
     ``(num_slots, page_bytes[t] * sub_blocks)`` with row stride ``slot_stride``
     -- the CPU-side shape ``SingleDirectionOffloadingHandler`` expects,
     addressed by slot id.
     """
-    pool = plan.pool
-    layout = tensor_layout(plan.page_bytes, pool.sub_blocks)
-    verify_pool_layout(pool, layout)
+    group = plan.group
+    pool = regions.geometry.require_pool(PoolKind(group.kind))
+    layout = group_tensor_layout(group, plan.page_bytes)
+    verify_group_layout(pool, group, layout)
     if not 0 <= writer_idx < pool.num_slices:
         raise ValueError(
             f"writer index {writer_idx} out of range for {pool.num_slices} "
@@ -177,7 +180,7 @@ def pool_views(
     views = [
         torch.as_strided(
             base,
-            (pool.num_slots, page * pool.sub_blocks),
+            (pool.num_slots, page * group.sub_blocks),
             (pool.slot_stride, 1),
             storage_offset=slice_base + offset,
         )
@@ -187,9 +190,9 @@ def pool_views(
 
 
 @dataclass
-class _PoolHandlers:
-    plan: PoolPlan
-    base: torch.Tensor
+class _GroupHandlers:
+    group: GroupLayout
+    cpu_base: torch.Tensor
     store: SingleDirectionOffloadingHandler
     load: SingleDirectionOffloadingHandler
 
@@ -210,7 +213,7 @@ class RadixShmemOffloadingWorker(OffloadingWorker):
         self.tp_rank: int | None = None
         self._data_base: torch.Tensor | None = None
         self._registered_ptr: int | None = None
-        self._pools: dict[int, _PoolHandlers] | None = None
+        self._groups: dict[int, _GroupHandlers] | None = None
         # parent job -> outstanding child job ids, and their finished results
         self._children: dict[int, set[int]] = {}
         self._child_results: dict[int, list[TransferResult]] = {}
@@ -236,7 +239,7 @@ class RadixShmemOffloadingWorker(OffloadingWorker):
 
     def _attach_now(self) -> None:
         with self._attach_lock:
-            if self._pools is not None:
+            if self._groups is not None:
                 return
             regions, tp_rank = self._attach()
             geometry = regions.geometry
@@ -248,20 +251,20 @@ class RadixShmemOffloadingWorker(OffloadingWorker):
             register_s = time.perf_counter() - t0
             self._registered_ptr = data_base.data_ptr()
 
-            pools: dict[int, _PoolHandlers] = {}
-            for plan in plan_pools(geometry, self._kv_caches):
+            groups: dict[int, _GroupHandlers] = {}
+            for plan in plan_groups(geometry, self._kv_caches):
                 if not plan.gpu_tensors:
                     continue
-                base, cpu_tensors = pool_views(regions, plan, writer_idx)
+                cpu_base, cpu_tensors = group_cpu_views(regions, plan, writer_idx)
                 common = dict(
                     gpu_tensors=plan.gpu_tensors,
                     cpu_tensors=cpu_tensors,
-                    blocks_per_chunk=plan.pool.sub_blocks,
-                    layer_refs_per_group=plan.refs_per_group,
+                    blocks_per_chunk=plan.group.sub_blocks,
+                    layer_refs_per_group=[plan.refs],
                 )
-                pools[plan.pool.kind] = _PoolHandlers(
-                    plan=plan,
-                    base=base,
+                groups[plan.group.group_idx] = _GroupHandlers(
+                    group=plan.group,
+                    cpu_base=cpu_base,
                     store=SingleDirectionOffloadingHandler(gpu_to_cpu=True, **common),
                     load=SingleDirectionOffloadingHandler(gpu_to_cpu=False, **common),
                 )
@@ -269,16 +272,16 @@ class RadixShmemOffloadingWorker(OffloadingWorker):
             self.tp_rank = tp_rank
             self._data_base = data_base
             # published last: this is what _ensure_attached checks
-            self._pools = pools
+            self._groups = groups
 
             logger.info(
-                "RadixShmem worker tp_rank=%d attached: pools %s, writing slice %d "
-                "of %d, cudaHostRegister(%.2f GiB) took %.3f s",
+                "RadixShmem worker tp_rank=%d attached: %d groups over pools %s, "
+                "writing slice %d of %d, cudaHostRegister(%.2f GiB) took %.3f s",
                 tp_rank,
+                len(groups),
                 ", ".join(
-                    f"{PoolKind(k).name}({len(h.plan.gpu_tensors)} tensors, "
-                    f"{h.plan.pool.sub_blocks} sub-blocks)"
-                    for k, h in pools.items()
+                    f"{PoolKind(p.kind).name}({p.num_slots}x{p.slot_stride}B)"
+                    for p in geometry.pools
                 ),
                 writer_idx,
                 geometry.num_slices,
@@ -286,9 +289,9 @@ class RadixShmemOffloadingWorker(OffloadingWorker):
                 register_s,
             )
 
-    def _ensure_attached(self) -> dict[int, _PoolHandlers]:
+    def _ensure_attached(self) -> dict[int, _GroupHandlers]:
         """Join the background attach; do it here if it never finished."""
-        if self._pools is None:
+        if self._groups is None:
             t0 = time.perf_counter()
             if self._attach_thread is not None:
                 self._attach_thread.join()
@@ -302,28 +305,24 @@ class RadixShmemOffloadingWorker(OffloadingWorker):
                     "RadixShmem worker attach blocked the first transfer for %.3f s",
                     waited,
                 )
-        assert self._pools is not None
-        return self._pools
+        assert self._groups is not None
+        return self._groups
 
     # ------------------------------------------------------------- jobs
 
     def _split(
         self, job_id: int, gpu_spec: GPULoadStoreSpec, cpu_spec: LoadStoreSpec
     ) -> list[tuple[int, int, GPULoadStoreSpec, CPULoadStoreSpec]]:
-        """Split one connector job into (child_id, pool, gpu, cpu) per pool.
+        """Split one connector job into (child_id, group, gpu, cpu) per group.
 
-        The CPU ids are consumed group by group exactly as the handler does:
-        ``cdiv(group_size + block_index % sub_blocks, sub_blocks)`` per group.
+        The connector orders GPU blocks and CPU slots by group; each group of
+        ``group_size`` blocks consumes ``cdiv(group_size + block_index %
+        sub_blocks, sub_blocks)`` CPU slots -- exactly what the handler consumes.
         """
-        assert isinstance(cpu_spec, CPULoadStoreSpec) or hasattr(cpu_spec, "block_ids")
-        pools = self._ensure_attached()
-        assert self.regions is not None
-        geometry = self.regions.geometry
-        groups = geometry.groups
-        num_groups = len(groups)
+        groups = self._ensure_attached()
         gpu_ids = gpu_spec.block_ids
         cpu_ids = cpu_spec.block_ids  # type: ignore[attr-defined]
-        per_pool: dict[int, tuple[list[int], list[int], list[int], list[int]]] = {}
+        parts: list[tuple[int, int, GPULoadStoreSpec, CPULoadStoreSpec]] = []
         gpu_off = 0
         cpu_off = 0
         for g_idx, (size, first_block) in enumerate(
@@ -331,42 +330,39 @@ class RadixShmemOffloadingWorker(OffloadingWorker):
         ):
             if size == 0:
                 continue
-            kind = groups[g_idx].kind
-            sub_blocks = geometry.require_pool(kind).sub_blocks
+            handlers = groups.get(g_idx)
+            if handlers is None:
+                raise RuntimeError(f"no handlers for KV cache group {g_idx}")
+            sub_blocks = handlers.group.sub_blocks
             n_cpu = cdiv(size + first_block % sub_blocks, sub_blocks)
-            entry = per_pool.setdefault(
-                kind, ([], [0] * num_groups, [0] * num_groups, [])
+            parts.append(
+                (
+                    job_id * _CHILD_STRIDE + g_idx,
+                    g_idx,
+                    GPULoadStoreSpec(
+                        [int(b) for b in gpu_ids[gpu_off : gpu_off + size]],
+                        group_sizes=(size,),
+                        block_indices=(first_block,),
+                    ),
+                    CPULoadStoreSpec(
+                        [int(c) for c in cpu_ids[cpu_off : cpu_off + n_cpu]]
+                    ),
+                )
             )
-            entry[0].extend(int(b) for b in gpu_ids[gpu_off : gpu_off + size])
-            entry[1][g_idx] = int(size)
-            entry[2][g_idx] = int(first_block)
-            entry[3].extend(int(c) for c in cpu_ids[cpu_off : cpu_off + n_cpu])
             gpu_off += size
             cpu_off += n_cpu
         assert gpu_off == len(gpu_ids), (gpu_off, len(gpu_ids))
         assert cpu_off == len(cpu_ids), (cpu_off, len(cpu_ids))
-        parts = []
-        for kind, (blocks, sizes, indices, slots) in per_pool.items():
-            if kind not in pools:
-                raise RuntimeError(f"no handlers for pool {PoolKind(kind).name}")
-            parts.append(
-                (
-                    job_id * _CHILD_STRIDE + kind,
-                    kind,
-                    GPULoadStoreSpec(blocks, group_sizes=sizes, block_indices=indices),
-                    CPULoadStoreSpec(slots),
-                )
-            )
         return parts
 
     def _submit(self, job_id: int, gpu_spec, cpu_spec, *, store: bool) -> bool:
         parts = self._split(job_id, gpu_spec, cpu_spec)
         if not parts:
             return False
-        pools = self._ensure_attached()
+        groups = self._ensure_attached()
         children: set[int] = set()
-        for child_id, kind, gpu, cpu in parts:
-            handler = pools[kind].store if store else pools[kind].load
+        for child_id, g_idx, gpu, cpu in parts:
+            handler = groups[g_idx].store if store else groups[g_idx].load
             ok = (
                 handler.transfer_async(child_id, gpu, cpu)
                 if store
@@ -392,10 +388,10 @@ class RadixShmemOffloadingWorker(OffloadingWorker):
         return self._submit(job_id, dst_spec, src_spec, store=False)
 
     def get_finished(self) -> list[TransferResult]:
-        if not self._pools:
+        if not self._groups:
             return []
         results: list[TransferResult] = []
-        for handlers in self._pools.values():
+        for handlers in self._groups.values():
             for child in handlers.store.get_finished() + handlers.load.get_finished():
                 parent = child.job_id // _CHILD_STRIDE
                 outstanding = self._children.get(parent)
@@ -418,10 +414,10 @@ class RadixShmemOffloadingWorker(OffloadingWorker):
         return results
 
     def wait(self, job_ids: set[int]) -> None:
-        if not self._pools:
+        if not self._groups:
             return
         children = {c for j in job_ids for c in self._children.get(j, ())}
-        for handlers in self._pools.values():
+        for handlers in self._groups.values():
             handlers.store.wait(children)
             handlers.load.wait(children)
 
@@ -442,13 +438,13 @@ class RadixShmemOffloadingWorker(OffloadingWorker):
                 )
                 return
             self._attach_thread = None
-        for handlers in (self._pools or {}).values():
+        for handlers in (self._groups or {}).values():
             for handler in (handlers.store, handlers.load):
                 try:
                     handler.shutdown()
                 except Exception:
                     logger.exception("RadixShmem: error draining transfers at shutdown")
-        self._pools = None
+        self._groups = None
         if self._registered_ptr is not None:
             host_unregister(self._registered_ptr)
             self._registered_ptr = None

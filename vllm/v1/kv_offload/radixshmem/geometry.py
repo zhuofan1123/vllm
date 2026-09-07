@@ -72,7 +72,14 @@ def _align_up(value: int, align: int) -> int:
 
 @dataclass(frozen=True)
 class GroupLayout:
-    """How one KV cache group maps onto its pool."""
+    """How one KV cache group maps onto its pool.
+
+    Every group of a pool owns a contiguous byte region inside each slot's TP
+    slice (``region_offset``, ``sub_blocks`` GPU blocks). Different groups of
+    one pool may have different ``sub_blocks`` (DeepSeek-V4's windowed groups
+    span 4 / 32 / 64 GPU blocks of a full-attention position), so each group
+    gets its own transfer handler.
+    """
 
     group_idx: int
     kind: int  # PoolKind value
@@ -80,20 +87,26 @@ class GroupLayout:
     hashes_per_chunk: int
     # chunks of this group per FULL chunk (1 for FULL and MAMBA groups)
     ratio: int
+    # GPU blocks one slot holds for this group (blocks_per_chunk * ratio)
+    sub_blocks: int
     # KV bytes one rank holds per GPU block for this group's layers
     bytes_per_block: int
+    # byte offset of this group's region within one TP slice of its pool's slot
+    region_offset: int
     # block-outermost layouts: (offset in the packed block, page bytes) per
     # layer; empty when the canonical tensors are already per layer
     layer_pages: tuple[tuple[int, int], ...] = ()
+
+    @property
+    def region_bytes(self) -> int:
+        return self.bytes_per_block * self.sub_blocks
 
 
 @dataclass(frozen=True)
 class PoolSpec:
     kind: int  # PoolKind value
     num_slots: int
-    # GPU blocks of one group spanned by one slot: blocks_per_chunk * ratio
-    sub_blocks: int
-    slice_bytes: int  # one writer's share of a slot
+    slice_bytes: int  # one writer's share of a slot (sum of its groups' regions)
     num_slices: int  # tp_size, or 1 when the KV is replicated across TP ranks
     slot_bytes: int  # slice_bytes * num_slices (unpadded)
     slot_stride: int  # slot_bytes rounded up to slot_align
@@ -252,7 +265,12 @@ def compute_geometry(config: "OffloadingConfig") -> SlotGeometry:
     if slot_align <= 0 or (slot_align & (slot_align - 1)) != 0:
         raise ValueError(f"slot_align must be a power of two, got {slot_align}")
 
-    groups: list[GroupLayout] = []
+    # default share of the budget each pool gets when its slot count is not
+    # pinned in extra_config; renormalized over the pools that are present
+    _DEFAULT_SHARE = {PoolKind.FULL: 0.70, PoolKind.SWA: 0.25, PoolKind.MAMBA: 0.05}
+
+    # first pass: per group kind, ratio, sub_blocks, bytes; and the window
+    prelim: list[dict[str, Any]] = []
     swa_window_blocks = 0
     for idx, g in enumerate(config.groups):
         g_tokens_per_chunk = g.tokens_per_block * blocks_per_chunk
@@ -276,40 +294,39 @@ def compute_geometry(config: "OffloadingConfig") -> SlotGeometry:
                 f"KV cache group {idx} reports no KV bytes per block; the offloading "
                 "config must carry worker_kv_bytes_per_block per group"
             )
-        groups.append(
-            GroupLayout(
+        # one slot spans one full-attention position: ratio group-chunks, each
+        # of blocks_per_chunk GPU blocks. MAMBA keeps a single checkpoint block.
+        sub_blocks = 1 if kind == PoolKind.MAMBA else blocks_per_chunk * ratio
+        prelim.append(
+            dict(
                 group_idx=idx,
                 kind=int(kind),
                 tokens_per_chunk=g_tokens_per_chunk,
                 hashes_per_chunk=g_tokens_per_chunk // tokens_per_hash,
                 ratio=ratio,
+                sub_blocks=sub_blocks,
                 bytes_per_block=g.worker_kv_bytes_per_block,
                 layer_pages=tuple(tuple(lp) for lp in g.layer_pages),
             )
         )
 
-    # slot sizes per pool
-    pool_dims: dict[PoolKind, tuple[int, int]] = {}  # kind -> (sub_blocks, slice)
+    # lay each pool's groups out back-to-back inside a slice
+    groups_list: list[GroupLayout] = []
+    slice_bytes: dict[PoolKind, int] = {}
     for kind in PoolKind:
-        members = [g for g in groups if g.kind == int(kind)]
-        if not members:
-            continue
-        sub_blocks_set = {blocks_per_chunk * g.ratio for g in members}
-        if len(sub_blocks_set) != 1:
-            raise ValueError(
-                f"{kind.name} groups have different chunk sizes "
-                f"({sorted(sub_blocks_set)} GPU blocks per slot); not supported"
-            )
-        sub_blocks = sub_blocks_set.pop()
-        pool_dims[kind] = (
-            sub_blocks,
-            sum(g.bytes_per_block for g in members) * sub_blocks,
-        )
+        off = 0
+        for m in prelim:
+            if m["kind"] != int(kind):
+                continue
+            groups_list.append(GroupLayout(region_offset=off, **m))
+            off += m["bytes_per_block"] * m["sub_blocks"]
+        if off:
+            slice_bytes[kind] = off
+    groups = sorted(groups_list, key=lambda g: g.group_idx)
 
-    # Node-wide budget shared by every DP rank and every instance attaching
-    # this region: never divide by world_size. Pools without an explicit slot
-    # count get as many slots as the FULL pool, which is cheap since their
-    # slots are a small fraction of a FULL slot.
+    # Node-wide budget shared by every DP rank and every instance attaching this
+    # region: never divide by world_size. Each present pool's slot count is
+    # pinned by extra_config or defaults to a share of the budget.
     cpu_bytes_to_use = extra.get("cpu_bytes_to_use")
     if not cpu_bytes_to_use:
         raise ValueError(
@@ -317,53 +334,43 @@ def compute_geometry(config: "OffloadingConfig") -> SlotGeometry:
         )
     budget = int(cpu_bytes_to_use)
     strides = {
-        kind: _align_up(slice_bytes * num_slices, slot_align)
-        for kind, (_, slice_bytes) in pool_dims.items()
+        kind: _align_up(slice_bytes[kind] * num_slices, slot_align)
+        for kind in slice_bytes
     }
     fixed: dict[PoolKind, int] = {}
-    for kind in pool_dims:
+    for kind in strides:
         raw = extra.get(_SLOT_OVERRIDE_KEYS[kind])
         if raw is not None:
             fixed[kind] = int(raw)
             if fixed[kind] <= 0:
                 raise ValueError(f"{_SLOT_OVERRIDE_KEYS[kind]} must be > 0")
     remaining = budget - sum(fixed[k] * strides[k] for k in fixed)
-    per_full_slot = sum(strides[k] for k in pool_dims if k not in fixed)
-    if PoolKind.FULL in fixed:
-        num_full = fixed[PoolKind.FULL]
-        derived = (
-            (remaining - num_full * strides[PoolKind.FULL]) // per_full_slot
-            if per_full_slot
-            else num_full
+    share_total = sum(_DEFAULT_SHARE[k] for k in strides if k not in fixed) or 1.0
+    counts: dict[PoolKind, int] = dict(fixed)
+    for kind in strides:
+        if kind in counts:
+            continue
+        counts[kind] = (
+            int(remaining * (_DEFAULT_SHARE[kind] / share_total)) // (strides[kind])
         )
-    else:
-        num_full = remaining // per_full_slot if per_full_slot else 0
-        derived = num_full
-    if num_full <= 0 or derived <= 0:
-        raise ValueError(
-            f"cpu_bytes_to_use ({budget}) is too small for one slot of every pool "
-            f"(strides {dict((k.name, v) for k, v in strides.items())})"
-        )
+        if counts[kind] <= 0:
+            raise ValueError(
+                f"cpu_bytes_to_use ({budget}) leaves no room for the "
+                f"{kind.name} pool ({strides[kind]} B per slot); raise it or set "
+                f"{_SLOT_OVERRIDE_KEYS[kind]}"
+            )
 
     pools: list[PoolSpec] = []
     for kind in PoolKind:
-        if kind not in pool_dims:
+        if kind not in slice_bytes:
             continue
-        sub_blocks, slice_bytes = pool_dims[kind]
-        if kind in fixed:
-            num_slots = fixed[kind]
-        elif kind == PoolKind.FULL:
-            num_slots = num_full
-        else:
-            num_slots = derived
         pools.append(
             PoolSpec(
                 kind=int(kind),
-                num_slots=num_slots,
-                sub_blocks=sub_blocks,
-                slice_bytes=slice_bytes,
+                num_slots=counts[kind],
+                slice_bytes=slice_bytes[kind],
                 num_slices=num_slices,
-                slot_bytes=slice_bytes * num_slices,
+                slot_bytes=slice_bytes[kind] * num_slices,
                 slot_stride=strides[kind],
             )
         )
@@ -389,41 +396,42 @@ def compute_geometry(config: "OffloadingConfig") -> SlotGeometry:
 
 
 @dataclass(frozen=True)
-class TensorLayout:
-    """Where each canonical tensor of a pool lives inside one slice."""
+class GroupTensorLayout:
+    """Where a group's canonical tensors sit inside one slot slice."""
 
     page_bytes: tuple[int, ...]  # per tensor, one GPU block
     offsets: tuple[int, ...]  # byte offset within the slice
-    total_bytes: int
+    end: int  # first byte past the group's region
 
 
-def tensor_layout(page_bytes: list[int], sub_blocks: int) -> TensorLayout:
-    """Lay a pool's canonical tensors out back-to-back inside a slice.
+def group_tensor_layout(group: GroupLayout, page_bytes: list[int]) -> GroupTensorLayout:
+    """Lay a group's canonical tensors out back-to-back in its slot region.
 
-    Tensor t occupies ``page_bytes[t] * sub_blocks`` bytes, holding the
-    ``sub_blocks`` GPU sub-blocks of one slot contiguously.
+    Tensor t occupies ``page_bytes[t] * sub_blocks`` bytes, holding the group's
+    ``sub_blocks`` GPU sub-blocks of one slot contiguously, starting at the
+    group's ``region_offset`` inside the slice.
     """
     offsets: list[int] = []
-    cursor = 0
+    cursor = group.region_offset
     for page in page_bytes:
         offsets.append(cursor)
-        cursor += page * sub_blocks
-    return TensorLayout(
-        page_bytes=tuple(page_bytes), offsets=tuple(offsets), total_bytes=cursor
+        cursor += page * group.sub_blocks
+    return GroupTensorLayout(
+        page_bytes=tuple(page_bytes), offsets=tuple(offsets), end=cursor
     )
 
 
-def verify_pool_layout(pool: PoolSpec, layout: TensorLayout) -> None:
-    """Worker-side check that the real tensors fit the published pool.
+def verify_group_layout(
+    pool: PoolSpec, group: GroupLayout, layout: GroupTensorLayout
+) -> None:
+    """Worker-side check that a group's real tensors fit its slot region.
 
-    The pool was sized from per-group ``worker_kv_bytes_per_block``.
-    Canonicalization may dedupe layers that alias the same bytes, so the real
-    tensors can be smaller, but never larger.
+    The region was sized from ``worker_kv_bytes_per_block``. Canonicalization
+    may dedupe aliased layers, so the real tensors can be smaller, never larger.
     """
-    if layout.total_bytes > pool.slice_bytes:
+    if layout.end > pool.slice_bytes:
         raise GeometryMismatch(
-            f"RadixShmem: the {PoolKind(pool.kind).name} KV cache tensors on this "
-            "worker do not fit the geometry published by the region owner. Bytes "
-            f"per slot per rank: actual={layout.total_bytes}, "
-            f"published={pool.slice_bytes}. Page sizes: {layout.page_bytes}."
+            f"RadixShmem: group {group.group_idx}'s {PoolKind(pool.kind).name} "
+            f"tensors overflow the slot slice: region ends at {layout.end} B, "
+            f"slice is {pool.slice_bytes} B. Page sizes: {layout.page_bytes}."
         )

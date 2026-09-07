@@ -92,8 +92,25 @@ def build_offloading_config(
 
     parallel_config = vllm_config.parallel_config
     layer_placements = _layer_placements(kv_cache_config)
-    groups = tuple(
-        OffloadingGroupConfig(
+
+    def _group(group):
+        layer_pages = tuple(
+            layer_placements[name]
+            for name in group.layer_names
+            if name in layer_placements
+        )
+        # Size the group from the same per-layer pages the worker strides by:
+        # in block-outermost (packed) layouts the layer stride is padded larger
+        # than page_size_bytes (DeepSeek-V4 fp8_ds_mla), so summing page_size_bytes
+        # undersizes the slot. Layer-outermost has no placements; use the specs.
+        if layer_pages:
+            bytes_per_block = sum(page for _, page in layer_pages)
+        else:
+            bytes_per_block = sum(
+                spec.page_size_bytes
+                for spec in _group_layer_specs(group.layer_names, group.kv_cache_spec)
+            )
+        return OffloadingGroupConfig(
             tokens_per_block=resolve_dcp_kv_block_size(
                 group.kv_cache_spec,
                 parallel_config.decode_context_parallel_size,
@@ -102,18 +119,11 @@ def build_offloading_config(
             is_full_attention=is_full_attention_spec(group.kv_cache_spec),
             is_recurrent=_is_recurrent(group.kv_cache_spec),
             sliding_window_tokens=_sliding_window_tokens(group.kv_cache_spec),
-            worker_kv_bytes_per_block=sum(
-                spec.page_size_bytes
-                for spec in _group_layer_specs(group.layer_names, group.kv_cache_spec)
-            ),
-            layer_pages=tuple(
-                layer_placements[name]
-                for name in group.layer_names
-                if name in layer_placements
-            ),
+            worker_kv_bytes_per_block=bytes_per_block,
+            layer_pages=layer_pages,
         )
-        for group in kv_cache_config.kv_cache_groups
-    )
+
+    groups = tuple(_group(group) for group in kv_cache_config.kv_cache_groups)
 
     _, tokens_per_hash = resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
     for group in groups:

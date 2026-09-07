@@ -311,22 +311,25 @@ def test_swa_slot_is_published_only_when_every_sub_chunk_landed(manager):
 
 
 @pytest.mark.parametrize("regions", [HYBRID], indirect=True)
-def test_hit_boundary_needs_both_full_and_swa(manager):
-    """A longer FULL prefix without its SWA window is not a hit past the window."""
+def test_full_prefix_hits_independently_of_the_swa_window(manager):
+    """FULL and SWA are queried separately: a deep FULL prefix hits even where
+    the windowed group kept only its trailing window (upstream loads only the
+    window)."""
     hashes = block_hashes(8)
     ctx = req_context("a", hashes)
     full_keys, swa_keys = hybrid_keys(hashes)
     store(manager, ctx, full_keys + swa_keys[2:4])  # SWA window at position 1 only
     b = req_context("b", hashes)
-    # common_hit stops where SWA is available: 2 positions
-    assert (
-        lookups(manager, b, full_keys)
-        == [LookupResult.HIT] * 2 + [LookupResult.MISS] * 2
-    )
+    # every FULL position is a hit, regardless of where SWA was kept
+    assert lookups(manager, b, full_keys) == [LookupResult.HIT] * 4
+    # SWA hits only where its window was stored (chunks 2, 3 == position 1)
     assert (
         lookups(manager, b, swa_keys)
         == [LookupResult.MISS] * 2 + [LookupResult.HIT] * 2 + [LookupResult.MISS] * 4
     )
+    spec = manager.prepare_load(full_keys + swa_keys[2:4], b)
+    assert len(spec.block_ids) == 5  # 4 FULL slots + 1 SWA slot
+    manager.complete_load(full_keys + swa_keys[2:4], b)
     manager.on_schedule_end(STEP)
 
 

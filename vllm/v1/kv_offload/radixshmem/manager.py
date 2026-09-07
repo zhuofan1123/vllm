@@ -107,15 +107,21 @@ def _component(kind: int):
 
 
 class LookupLease:
-    """A pinned prefix hit: the slots stay valid until ``release()``."""
+    """A pinned prefix hit. FULL and the auxiliary components (SWA / MAMBA) are
+    queried separately -- a full-attention prefix stays a hit even where the
+    windowed groups only kept a trailing window -- so ``hit_blocks`` is the FULL
+    depth and ``swa_end`` may run deeper. Both queries' pins are released once.
+    """
 
     __slots__ = (
         "hit_blocks",
         "slots",
         "swa_start",
+        "swa_end",
         "swa_slots",
+        "mamba_position",
         "mamba_slot",
-        "_finalize",
+        "_finalizes",
         "_owner",
         "_released",
     )
@@ -125,17 +131,21 @@ class LookupLease:
         hit_blocks: int,
         slots: np.ndarray,
         swa_start: int,
+        swa_end: int,
         swa_slots: np.ndarray,
+        mamba_position: int,
         mamba_slot: int | None,
-        finalize,
+        finalizes: tuple,
         owner,
     ):
         self.hit_blocks = hit_blocks
         self.slots = slots
         self.swa_start = swa_start
+        self.swa_end = swa_end
         self.swa_slots = swa_slots
+        self.mamba_position = mamba_position
         self.mamba_slot = mamba_slot
-        self._finalize = finalize
+        self._finalizes = finalizes
         self._owner = owner
         self._released = False
 
@@ -144,23 +154,24 @@ class LookupLease:
         return self._released
 
     def swa_slot(self, position: int) -> int | None:
-        if self.swa_start <= position < self.hit_blocks and self.swa_slots.size:
+        if self.swa_start <= position < self.swa_end and self.swa_slots.size:
             return int(self.swa_slots[position - self.swa_start])
         return None
 
     def release(self) -> None:
-        """Drop the pin. Idempotent -- ``finalize`` is one-shot underneath."""
+        """Drop the pins. Idempotent -- each ``finalize`` is one-shot underneath."""
         if self._released:
             return
         self._released = True
         try:
-            self._finalize()
+            for finalize in self._finalizes:
+                finalize()
         finally:
             self._owner._forget(self)
 
     def __repr__(self) -> str:
         state = "released" if self._released else "held"
-        return f"LookupLease({self.hit_blocks} blocks, {state})"
+        return f"LookupLease({self.hit_blocks} FULL blocks, {state})"
 
 
 class RadixIndex:
@@ -168,8 +179,11 @@ class RadixIndex:
 
     def __init__(self, client, *, mask: int = PoolKind.FULL.mask):
         self.client = client
-        # components queried together: FULL plus whatever pools exist
-        self.mask = mask
+        # FULL is queried on its own for the prefix depth; the windowed
+        # components (SWA / MAMBA) are queried together, if present, so their
+        # partial coverage never shortens the FULL hit
+        self.full_mask = PoolKind.FULL.mask
+        self.aux_mask = mask & ~PoolKind.FULL.mask
         self._leases: set[LookupLease] = set()
         # counters, for logging and the connector's stats
         self.num_lookups = 0
@@ -210,7 +224,7 @@ class RadixIndex:
         t0 = time.perf_counter()
         r = self.client.query(
             hashes,
-            mask=self.mask if mask is None else mask,
+            mask=self.full_mask if mask is None else mask,
             local_only=True,
             lock=False,
             update_meta=touch,
@@ -229,9 +243,10 @@ class RadixIndex:
         self.num_lookups += 1
         if hashes.size == 0:
             return None
+        finalizes: list = []
         t0 = time.perf_counter()
         r = self.client.query(
-            hashes, mask=self.mask, local_only=True, lock=True, update_meta=True
+            hashes, mask=self.full_mask, local_only=True, lock=True, update_meta=True
         )
         self.time_query_s += time.perf_counter() - t0
         self.num_queries += 1
@@ -241,6 +256,7 @@ class RadixIndex:
             # valid one-shot; call it so nothing is left dangling.
             r.finalize()
             return None
+        finalizes.append(r.finalize)
         # Full slots come back as (source_rank, offset, slot_ids) runs tiling
         # [0, common_hit) in offset order; local_only gives at most one run.
         runs = [np.asarray(ids, dtype=np.int32) for _, _, ids in r.full_fragments]
@@ -251,16 +267,41 @@ class RadixIndex:
                 f"RadixShmem: query hit {hit} blocks but returned "
                 f"{slots.size} Full slots"
             )
-        swa_slots = np.asarray(getattr(r, "swa_slots", ()), dtype=np.int32)
-        swa_start = int(getattr(r, "swa_start", hit)) if swa_slots.size else hit
-        mamba = getattr(r, "mamba", None)
+
+        swa_start = swa_end = hit
+        swa_slots = np.empty(0, dtype=np.int32)
+        mamba_position, mamba_slot = -1, None
+        if self.aux_mask:
+            t0 = time.perf_counter()
+            aux = self.client.query(
+                hashes,
+                mask=self.aux_mask,
+                local_only=True,
+                lock=True,
+                update_meta=True,
+            )
+            self.time_query_s += time.perf_counter() - t0
+            self.num_queries += 1
+            aux_hit = self._hit_blocks(aux)
+            got = np.asarray(getattr(aux, "swa_slots", ()), dtype=np.int32)
+            if aux_hit > 0 and got.size:
+                swa_slots = got
+                swa_end = aux_hit
+                swa_start = aux_hit - got.size
+            mamba = getattr(aux, "mamba", None)
+            if aux_hit > 0 and mamba is not None:
+                mamba_position, mamba_slot = aux_hit - 1, int(mamba[1])
+            finalizes.append(aux.finalize)
+
         lease = LookupLease(
             hit,
             np.ascontiguousarray(slots[:hit], dtype=np.int32),
             swa_start,
+            swa_end,
             swa_slots,
-            int(mamba[1]) if mamba is not None else None,
-            r.finalize,
+            mamba_position,
+            mamba_slot,
+            tuple(finalizes),
             self,
         )
         self.num_hit_blocks += hit
@@ -578,20 +619,24 @@ class RadixShmemOffloadingManager(OffloadingManager):
         group, position, _ = located
         self._dirty.add(req_context.req_id)
         lease = self._round_lease(state)
-        if lease is None or position >= lease.hit_blocks:
+        if lease is None:
             return LookupResult.MISS
         if group.kind == PoolKind.FULL:
-            return LookupResult.HIT
+            return (
+                LookupResult.HIT if position < lease.hit_blocks else LookupResult.MISS
+            )
         if group.kind == PoolKind.SWA:
+            # a windowed group hits on its own window, independent of the FULL
+            # prefix depth (the connector loads only the window)
             return (
                 LookupResult.HIT
                 if lease.swa_slot(position) is not None
                 else LookupResult.MISS
             )
-        # MAMBA: only the checkpoint at the hit boundary is usable
+        # MAMBA: only the checkpoint at its own hit boundary is usable
         return (
             LookupResult.HIT
-            if lease.mamba_slot is not None and position == lease.hit_blocks - 1
+            if lease.mamba_slot is not None and position == lease.mamba_position
             else LookupResult.MISS
         )
 
@@ -627,12 +672,12 @@ class RadixShmemOffloadingManager(OffloadingManager):
             located = self._locate(state, req_context, key)
             assert located is not None, f"load of a key foreign to the request: {key!r}"
             group, position, _ = located
-            if position >= lease.hit_blocks:
-                raise RuntimeError(
-                    f"RadixShmem: load of position {position} beyond the hit "
-                    f"({lease.hit_blocks})"
-                )
             if group.kind == PoolKind.FULL:
+                if position >= lease.hit_blocks:
+                    raise RuntimeError(
+                        f"RadixShmem: FULL load of position {position} beyond the "
+                        f"hit ({lease.hit_blocks})"
+                    )
                 slot = int(lease.slots[position])
             elif group.kind == PoolKind.SWA:
                 # one slot per position; the connector lists every sub-chunk key
@@ -645,7 +690,7 @@ class RadixShmemOffloadingManager(OffloadingManager):
                     )
                 slot = swa
             else:
-                if lease.mamba_slot is None or position != lease.hit_blocks - 1:
+                if lease.mamba_slot is None or position != lease.mamba_position:
                     raise RuntimeError("RadixShmem: MAMBA checkpoint was not a hit")
                 slot = lease.mamba_slot
             slots.append(slot)

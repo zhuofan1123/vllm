@@ -244,15 +244,17 @@ def test_attach_times_out_without_owner(request):
     assert time.monotonic() - t0 >= 1.0
 
 
-def test_stale_sentinel_from_dead_owner_is_rejected(request, tmp_path):
+def test_stale_sentinel_from_dead_owner_waits_then_times_out(request, tmp_path):
     g = compute_geometry(make_offloading_config(tag=unique_tag(request)))
     path = sentinel_path(g, str(tmp_path))
     with open(path, "w") as f:
         json.dump(
             {"version": SENTINEL_VERSION, "pid": 2**22, "geometry": g.to_dict()}, f
         )
-    with pytest.raises(RuntimeError, match="not running"):
-        attach_regions(g, sentinel_dir=str(tmp_path), timeout_s=5, role="dp1")
+    # a restart legitimately sees the old owner's sentinel first, so this must
+    # wait for a replacement and only fail at the deadline
+    with pytest.raises(TimeoutError, match="dead owner"):
+        attach_regions(g, sentinel_dir=str(tmp_path), timeout_s=1, role="dp1")
 
 
 def test_diverging_none_hash_is_rejected(monkeypatch):

@@ -439,23 +439,38 @@ def _wait_for_sentinel(
     path: str, deadline: float, role: str
 ) -> tuple[SlotGeometry, int, str | None]:
     next_log = time.monotonic() + 30.0
+    stale_pid: int | None = None
     while True:
         payload = _read_sentinel(path)
         if payload is not None:
             pid = int(payload["pid"])
-            if not _pid_alive(pid):
-                raise RuntimeError(
-                    f"RadixShmem: sentinel {path} names owner pid {pid}, which "
-                    "is not running. This is a leftover from a crashed run -- "
-                    "delete the sentinel and the shm regions, then restart."
+            if _pid_alive(pid):
+                return (
+                    SlotGeometry.from_dict(payload["geometry"]),
+                    pid,
+                    payload.get("none_hash"),
                 )
-            return (
-                SlotGeometry.from_dict(payload["geometry"]),
-                pid,
-                payload.get("none_hash"),
-            )
+            # A dead owner's sentinel is what a restart finds first: workers
+            # start attaching before the new scheduler has replaced it, so keep
+            # waiting rather than failing; only a timeout makes it an error.
+            if stale_pid != pid:
+                stale_pid = pid
+                logger.info(
+                    "RadixShmem %s: %s names dead owner pid %d; waiting for a "
+                    "new owner to replace it",
+                    role,
+                    path,
+                    pid,
+                )
         now = time.monotonic()
         if now > deadline:
+            if stale_pid is not None:
+                raise TimeoutError(
+                    f"RadixShmem: {role} timed out waiting for {path}, which "
+                    f"still names dead owner pid {stale_pid}. This is a leftover "
+                    "from a crashed run -- delete the sentinel and the shm "
+                    "regions, or start the owning scheduler."
+                )
             raise TimeoutError(
                 f"RadixShmem: {role} timed out waiting for {path}. The owning "
                 "scheduler is responsible for creating it; check its logs."

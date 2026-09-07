@@ -44,7 +44,7 @@ from .geometry import (
 
 logger = init_logger(__name__)
 
-SENTINEL_VERSION = 3
+SENTINEL_VERSION = 4
 
 SHM_ROLES = ("auto", "owner", "attach")
 
@@ -69,6 +69,33 @@ def sentinel_path(geometry: SlotGeometry, sentinel_dir: str) -> str:
 
 def _pid_alive(pid: int) -> bool:
     return pid > 0 and os.path.exists(f"/proc/{pid}")
+
+
+def _proc_start_time(pid: int) -> int | None:
+    """Kernel start time (clock ticks) of ``pid``; None if it is gone."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            stat = f.read()
+    except OSError:
+        return None
+    # field 22, counted after the ")" that ends the (possibly spaced) comm
+    fields = stat[stat.rindex(")") + 2 :].split()
+    return int(fields[19])
+
+
+def _owner_alive(payload: dict[str, Any]) -> bool:
+    """Whether the process that wrote a sentinel is still the one running.
+
+    Pids get reused: after a hard kill, a fresh process may sit on the old
+    owner's pid within minutes, so liveness is pid *and* start time. Sentinels
+    written before start times were recorded fall back to the pid alone.
+    """
+    pid = int(payload["pid"])
+    start = _proc_start_time(pid)
+    if start is None:
+        return False
+    expected = payload.get("pid_start")
+    return expected is None or int(expected) == start
 
 
 def _region_file(name: str, hugepage_path: str) -> str:
@@ -189,7 +216,7 @@ def open_regions(
     sentinel = sentinel_path(geometry, sentinel_dir)
     with _ownership_lock(sentinel):
         existing = _read_sentinel(sentinel)
-        live_owner = existing is not None and _pid_alive(int(existing["pid"]))
+        live_owner = existing is not None and _owner_alive(existing)
         if not live_owner:
             return create_regions(
                 geometry, extra, sentinel_dir=sentinel_dir, force_reclaim=False
@@ -221,7 +248,7 @@ def create_regions(
 
     sentinel = sentinel_path(geometry, sentinel_dir)
     existing = _read_sentinel(sentinel)
-    if existing is not None and _pid_alive(existing["pid"]) and not force_reclaim:
+    if existing is not None and _owner_alive(existing) and not force_reclaim:
         raise RuntimeError(
             f"RadixShmem: {sentinel} already claims regions "
             f"{geometry.index_shm_name} / {geometry.data_shm_name}, owned by "
@@ -302,7 +329,9 @@ def attach_regions(
     sentinel = sentinel_path(geometry, sentinel_dir)
     deadline = time.monotonic() + timeout_s
 
-    published, owner_pid, owner_none_hash = _wait_for_sentinel(sentinel, deadline, role)
+    published, owner_pid, owner_start, owner_none_hash = _wait_for_sentinel(
+        sentinel, deadline, role
+    )
     geometry.check_same(published, what="the region owner")
     if check_block_hashes:
         check_none_hash(owner_none_hash, what="the region owner")
@@ -321,7 +350,7 @@ def attach_regions(
     )
 
     _check_attached(geometry, client, store)
-    if not _pid_alive(owner_pid):
+    if not _owner_alive({"pid": owner_pid, "pid_start": owner_start}):
         raise RuntimeError(
             f"RadixShmem: owner pid {owner_pid} died while {role} was attaching; "
             "the regions it published may already have been unlinked"
@@ -413,6 +442,7 @@ def _write_sentinel(path: str, geometry: SlotGeometry) -> None:
     payload = {
         "version": SENTINEL_VERSION,
         "pid": os.getpid(),
+        "pid_start": _proc_start_time(os.getpid()),
         "geometry": geometry.to_dict(),
         "none_hash": none_hash_fingerprint(),
     }
@@ -437,17 +467,18 @@ def _read_sentinel(path: str) -> dict[str, Any] | None:
 
 def _wait_for_sentinel(
     path: str, deadline: float, role: str
-) -> tuple[SlotGeometry, int, str | None]:
+) -> tuple[SlotGeometry, int, int | None, str | None]:
     next_log = time.monotonic() + 30.0
     stale_pid: int | None = None
     while True:
         payload = _read_sentinel(path)
         if payload is not None:
             pid = int(payload["pid"])
-            if _pid_alive(pid):
+            if _owner_alive(payload):
                 return (
                     SlotGeometry.from_dict(payload["geometry"]),
                     pid,
+                    payload.get("pid_start"),
                     payload.get("none_hash"),
                 )
             # A dead owner's sentinel is what a restart finds first: workers

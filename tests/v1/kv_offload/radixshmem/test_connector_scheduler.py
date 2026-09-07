@@ -52,6 +52,8 @@ def make_scheduler(tag: str) -> OffloadingConnectorScheduler:
         }
     )
     vllm_config.speculative_config = None
+    # part of the model fingerprint; a MagicMock would differ per scheduler
+    vllm_config.cache_config.kv_cache_layout = "BLHNC"
     kv_cache_config = _make_kv_cache_config()
     spec = OffloadingSpecFactory.create_spec(
         build_offloading_config(vllm_config, kv_cache_config)

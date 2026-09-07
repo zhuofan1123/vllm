@@ -257,6 +257,49 @@ def test_stale_sentinel_from_dead_owner_waits_then_times_out(request, tmp_path):
         attach_regions(g, sentinel_dir=str(tmp_path), timeout_s=1, role="dp1")
 
 
+def test_reused_pid_does_not_pass_for_a_live_owner(request, tmp_path):
+    """A sentinel naming a live pid with another start time is a leftover."""
+    from vllm.v1.kv_offload.radixshmem.bootstrap import _owner_alive
+
+    g = compute_geometry(make_offloading_config(tag=unique_tag(request)))
+    payload = {"version": SENTINEL_VERSION, "pid": os.getpid(), "pid_start": 1}
+    assert not _owner_alive(payload)
+    payload["pid_start"] = None
+    assert _owner_alive(payload)  # legacy sentinel without start time
+    config = make_offloading_config(tag=unique_tag(request), tp_size=2)
+    path = sentinel_path(g, str(tmp_path))
+    with open(path, "w") as f:
+        json.dump({**payload, "pid_start": 1, "geometry": g.to_dict()}, f)
+    regions = open_regions(
+        g,
+        dict(config.extra_config),
+        prefer_owner=True,
+        role="dp0",
+        sentinel_dir=str(tmp_path),
+        timeout_s=5,
+    )
+    try:
+        assert regions.is_owner  # created fresh instead of attaching to junk
+    finally:
+        regions.close()
+
+
+def test_geometry_carries_the_model_identity():
+    a = compute_geometry(make_offloading_config(tag="geo"))
+    from dataclasses import replace
+
+    from vllm.v1.kv_offload.config import OffloadingModelConfig
+
+    other = replace(
+        make_offloading_config(tag="geo"),
+        model=OffloadingModelConfig(name="another-model", dtype="float16"),
+    )
+    b = compute_geometry(other)
+    assert a.model_fingerprint != b.model_fingerprint
+    with pytest.raises(GeometryMismatch, match="model_fingerprint"):
+        a.check_same(b, what="peer")
+
+
 def test_diverging_none_hash_is_rejected(monkeypatch):
     """A scheduler whose NONE_HASH differs can never share a prefix -- fail loud."""
     from vllm.v1.core import kv_cache_utils

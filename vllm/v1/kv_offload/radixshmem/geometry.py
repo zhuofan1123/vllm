@@ -23,6 +23,7 @@ in ``kv_offload/cpu`` expects, so the transfer path is upstream's, unchanged.
 Padding (``slot_stride - slot_bytes``) only ever lands at the tail of a slot.
 """
 
+import hashlib
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -69,6 +70,10 @@ class SlotGeometry:
     tp_size: int
     replicated: bool
     num_slots: int
+
+    # model identity: a region holds one model's KV, and two models with the
+    # same byte layout would otherwise attach to each other's cache
+    model_fingerprint: str = ""
 
     @property
     def total_data_bytes(self) -> int:
@@ -158,7 +163,12 @@ def compute_geometry(config: "OffloadingConfig") -> SlotGeometry:
             f"slot ({slot_stride} bytes)"
         )
 
+    fingerprint = hashlib.sha256(
+        f"{config.model.name}|{config.model.dtype}|{config.kv_cache_layout}".encode()
+    ).hexdigest()[:16]
+
     return SlotGeometry(
+        model_fingerprint=fingerprint,
         index_shm_name=str(extra.get("index_shm_name", DEFAULT_INDEX_SHM_NAME)),
         data_shm_name=str(extra.get("data_shm_name", DEFAULT_DATA_SHM_NAME)),
         hugepage_path=str(extra.get("hugepage_path", "")),

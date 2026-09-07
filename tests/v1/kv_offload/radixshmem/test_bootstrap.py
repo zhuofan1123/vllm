@@ -19,43 +19,90 @@ from vllm.v1.kv_offload.radixshmem.bootstrap import (
 )
 from vllm.v1.kv_offload.radixshmem.geometry import (
     GeometryMismatch,
+    PoolKind,
     SlotGeometry,
     compute_geometry,
 )
 
-from .utils import NUM_LAYERS, PAGE_BYTES, make_offloading_config, unique_tag
+from .utils import (
+    NUM_LAYERS,
+    PAGE_BYTES,
+    group,
+    hybrid_groups,
+    make_offloading_config,
+    unique_tag,
+)
 
 # ------------------------------------------------------------------ geometry
 
 
 def test_geometry_math():
     g = compute_geometry(make_offloading_config(tag="geo", tp_size=2))
-    assert g.blocks_per_chunk == 1
-    assert g.worker_bytes_per_block == PAGE_BYTES * NUM_LAYERS
-    assert g.slice_bytes == PAGE_BYTES * NUM_LAYERS
-    assert g.num_slices == 2
-    assert g.slot_bytes == PAGE_BYTES * NUM_LAYERS * 2
-    assert g.slot_stride == g.slot_bytes  # already 4K-aligned
-    assert g.num_slots == (8 << 20) // g.slot_stride
-    assert not g.replicated
+    assert g.blocks_per_chunk == 1 and g.tokens_per_chunk == 16
+    [full] = g.pools
+    assert full.kind == PoolKind.FULL
+    assert full.sub_blocks == 1
+    assert full.slice_bytes == PAGE_BYTES * NUM_LAYERS
+    assert full.num_slices == 2
+    assert full.slot_bytes == PAGE_BYTES * NUM_LAYERS * 2
+    assert full.slot_stride == full.slot_bytes  # already 4K-aligned
+    assert full.num_slots == (8 << 20) // full.slot_stride
+    assert not g.replicated and g.swa_window_blocks == 0
+    assert g.pool_mask == PoolKind.FULL.mask
 
 
 def test_geometry_blocks_per_chunk():
     g = compute_geometry(
         make_offloading_config(tag="geo", tp_size=4, blocks_per_chunk=4)
     )
-    assert g.blocks_per_chunk == 4
-    assert g.tokens_per_chunk == 64
-    assert g.slice_bytes == PAGE_BYTES * NUM_LAYERS * 4
-    assert g.slot_bytes == g.slice_bytes * 4
+    full = g.require_pool(PoolKind.FULL)
+    assert g.blocks_per_chunk == 4 and g.tokens_per_chunk == 64
+    assert full.sub_blocks == 4
+    assert full.slice_bytes == PAGE_BYTES * NUM_LAYERS * 4
+    assert full.slot_bytes == full.slice_bytes * 4
+
+
+def test_geometry_hybrid_pools():
+    """SWA chunks finer than FULL chunks share one SWA slot per FULL position."""
+    g = compute_geometry(
+        make_offloading_config(tag="geo", tp_size=1, groups=hybrid_groups())
+    )
+    assert g.tokens_per_chunk == 32
+    full, swa = g.pools
+    assert (full.kind, swa.kind) == (PoolKind.FULL, PoolKind.SWA)
+    assert g.groups[1].ratio == 2 and g.groups[1].hashes_per_chunk == 1
+    assert g.groups[0].ratio == 1 and g.groups[0].hashes_per_chunk == 2
+    assert swa.sub_blocks == 2  # two 16-token SWA blocks per 32-token position
+    assert swa.slice_bytes == PAGE_BYTES * 2
+    assert full.slice_bytes == 2 * PAGE_BYTES
+    assert g.swa_window_blocks == 1  # 32-token window == one FULL position
+    assert g.pool_mask == PoolKind.FULL.mask | PoolKind.SWA.mask
+    # pools without an explicit count get the FULL pool's count, all in budget
+    assert swa.num_slots == full.num_slots
+    assert g.total_data_bytes <= 8 << 20
+
+
+def test_geometry_pool_slot_overrides():
+    g = compute_geometry(
+        make_offloading_config(
+            tag="geo", tp_size=1, groups=hybrid_groups(), extra={"swa_slots": 8}
+        )
+    )
+    assert g.require_pool(PoolKind.SWA).num_slots == 8
+    full = g.require_pool(PoolKind.FULL)
+    assert (
+        full.num_slots * full.slot_stride + 8 * g.require_pool(PoolKind.SWA).slot_stride
+        <= 8 << 20
+    )
 
 
 def test_geometry_replicated_stores_one_slice():
     g = compute_geometry(
         make_offloading_config(tag="geo", tp_size=4, extra={"replicated_kv": True})
     )
-    assert g.replicated and g.num_slices == 1
-    assert g.slot_bytes == g.slice_bytes
+    full = g.require_pool(PoolKind.FULL)
+    assert g.replicated and full.num_slices == 1
+    assert full.slot_bytes == full.slice_bytes
     # vLLM's own detection is the default
     g2 = compute_geometry(
         make_offloading_config(tag="geo", tp_size=4, replicated_layout=True)
@@ -66,39 +113,44 @@ def test_geometry_replicated_stores_one_slice():
             tag="geo", tp_size=4, replicated_layout=True, extra={"replicated_kv": "0"}
         )
     )
-    assert not g3.replicated and g3.num_slices == 4
+    assert not g3.replicated and g3.require_pool(PoolKind.FULL).num_slices == 4
 
 
 def test_geometry_pads_to_slot_align():
     g = compute_geometry(
-        make_offloading_config(tag="geo", tp_size=1, worker_bytes_per_block=1000)
+        make_offloading_config(
+            tag="geo", tp_size=1, groups=[group(bytes_per_block=1000)]
+        )
     )
-    assert g.slot_bytes == 1000
-    assert g.slot_stride == 4096
+    full = g.require_pool(PoolKind.FULL)
+    assert full.slot_bytes == 1000
+    assert full.slot_stride == 4096
 
 
 def test_geometry_rejects_unsupported_parallelism():
-    config = make_offloading_config(tag="geo")
-    bad_pp = OffloadingParallelConfigPatch(config, pp_size=2)
-    with pytest.raises(ValueError, match="pipeline_parallel_size"):
-        compute_geometry(bad_pp)
-    bad_world = OffloadingParallelConfigPatch(config, world_size=4)
-    with pytest.raises(ValueError, match="world_size"):
-        compute_geometry(bad_world)
-
-
-def OffloadingParallelConfigPatch(config, **fields):
     from dataclasses import replace
 
-    return replace(config, parallel=replace(config.parallel, **fields))
+    config = make_offloading_config(tag="geo")
+    with pytest.raises(ValueError, match="pipeline_parallel_size"):
+        compute_geometry(replace(config, parallel=replace(config.parallel, pp_size=2)))
+    with pytest.raises(ValueError, match="world_size"):
+        compute_geometry(
+            replace(config, parallel=replace(config.parallel, world_size=4))
+        )
+
+
+def test_geometry_rejects_misaligned_windowed_chunks():
+    groups = [group(32, kind="full"), group(24, kind="swa", window=24)]
+    with pytest.raises(ValueError, match="does not divide"):
+        compute_geometry(make_offloading_config(tag="geo", groups=groups))
 
 
 def test_geometry_requires_cpu_bytes():
+    from dataclasses import replace
+
     config = make_offloading_config(tag="geo")
     extra = dict(config.extra_config)
     del extra["cpu_bytes_to_use"]
-    from dataclasses import replace
-
     with pytest.raises(ValueError, match="cpu_bytes_to_use"):
         compute_geometry(replace(config, extra_config=extra))
 
@@ -112,6 +164,13 @@ def test_check_same_reports_every_differing_field():
     assert "blocks_per_chunk" in msg and "tp_size" in msg
 
 
+def test_geometry_round_trips_through_the_sentinel_dict():
+    a = compute_geometry(
+        make_offloading_config(tag="geo", tp_size=1, groups=hybrid_groups())
+    )
+    assert SlotGeometry.from_dict(a.to_dict()) == a
+
+
 # ---------------------------------------------------------------- handshake
 
 
@@ -121,7 +180,8 @@ def _owner_proc(tag, ready_evt, done_evt, err_q):
         config = make_offloading_config(tag=tag, tp_size=2)
         g = compute_geometry(config)
         regions = create_regions(g, dict(config.extra_config))
-        regions.store.write_slot(3, bytes([0xAA]) * g.slice_bytes)
+        slice_bytes = g.require_pool(PoolKind.FULL).slice_bytes
+        regions.store.write_slot(3, bytes([0xAA]) * slice_bytes)
         err_q.put(("owner_pid", os.getpid()))
         ready_evt.set()
         assert done_evt.wait(60)
@@ -152,20 +212,23 @@ def test_owner_publishes_and_attacher_reads(request):
         regions = attach_regions(g, timeout_s=30, role="dp1")
         assert not regions.is_owner
         assert regions.owner_pid == owner_pid
-        assert regions.store.num_slots == g.num_slots
-        assert regions.store.slot_bytes == g.slot_stride
+        full = g.require_pool(PoolKind.FULL)
+        assert regions.store.num_slots == full.num_slots
+        assert regions.store.slot_bytes == full.slot_stride
 
         slot = regions.store.read_slot(3)
-        assert slot[: g.slice_bytes] == b"\xaa" * g.slice_bytes
+        assert slot[: full.slice_bytes] == b"\xaa" * full.slice_bytes
         # the other TP slice was never written
-        assert slot[g.slice_bytes :] == b"\x00" * (g.slot_stride - g.slice_bytes)
+        assert slot[full.slice_bytes :] == b"\x00" * (
+            full.slot_stride - full.slice_bytes
+        )
 
         # attacher writes the TP1 slice; owner-side memory is the same memory
         mv = regions.store.slot_view(3)
-        mv[g.slice_bytes : g.slot_bytes] = b"\xbb" * g.slice_bytes
+        mv[full.slice_bytes : full.slot_bytes] = b"\xbb" * full.slice_bytes
         del mv
-        assert regions.store.read_slot(3)[g.slice_bytes : g.slot_bytes] == (
-            b"\xbb" * g.slice_bytes
+        assert regions.store.read_slot(3)[full.slice_bytes : full.slot_bytes] == (
+            b"\xbb" * full.slice_bytes
         )
         regions.close()
     finally:
@@ -192,7 +255,8 @@ def test_auto_role_attaches_to_a_live_owner(request):
         )
         assert not regions.is_owner and regions.owner_pid == owner_pid
         # the owner's data is intact: nothing was unlinked and re-created
-        assert regions.store.read_slot(3)[: g.slice_bytes] == b"\xaa" * g.slice_bytes
+        slice_bytes = g.require_pool(PoolKind.FULL).slice_bytes
+        assert regions.store.read_slot(3)[:slice_bytes] == b"\xaa" * slice_bytes
         regions.close()
 
         with pytest.raises(RuntimeError, match="live pid"):
@@ -220,6 +284,35 @@ def test_auto_role_creates_when_nobody_owns(request):
         assert os.path.exists(sentinel_path(g, "/dev/shm"))
     finally:
         regions.close()
+
+
+def test_hybrid_pools_are_created_and_attached(request):
+    """SWA pool exists in store and index, and the attacher sees the same."""
+    tag = unique_tag(request)
+    config = make_offloading_config(tag=tag, tp_size=1, groups=hybrid_groups())
+    g = compute_geometry(config)
+    owner = create_regions(g, dict(config.extra_config))
+    try:
+        assert owner.store.pool_mask == g.pool_mask
+        assert (
+            owner.client.swa_mempool_total() == g.require_pool(PoolKind.SWA).num_slots
+        )
+        assert owner.client.component_config.swa_window_blocks == 1
+        peer = attach_regions(g, timeout_s=10, role="peer")
+        try:
+            assert (
+                peer.store.pool(PoolKind.SWA).num_slots
+                == owner.store.pool(PoolKind.SWA).num_slots
+            )
+            # the SWA pool is a separate range: writing a SWA slot leaves FULL alone
+            swa_bytes = g.require_pool(PoolKind.SWA).slot_stride
+            peer.store.write_slot(0, bytes([0x5A]) * swa_bytes, PoolKind.SWA)
+            assert owner.store.read_slot(0, PoolKind.SWA)[:8] == b"\x5a" * 8
+            assert owner.store.read_slot(0)[:8] == b"\x00" * 8
+        finally:
+            peer.close()
+    finally:
+        owner.close()
 
 
 def test_attach_geometry_mismatch_fails_closed(request):

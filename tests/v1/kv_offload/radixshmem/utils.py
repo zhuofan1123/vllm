@@ -30,15 +30,37 @@ PAGE_BYTES = 4096
 NUM_LAYERS = 2
 
 
+def group(
+    tokens_per_block: int = TOKENS_PER_BLOCK,
+    *,
+    kind: str = "full",
+    window: int | None = None,
+    bytes_per_block: int = PAGE_BYTES * NUM_LAYERS,
+    num_layers: int = NUM_LAYERS,
+    layer_pages: Sequence[tuple[int, int]] = (),
+    name: str = "g",
+) -> OffloadingGroupConfig:
+    """One KV cache group as build_offloading_config would describe it."""
+    return OffloadingGroupConfig(
+        tokens_per_block=tokens_per_block,
+        layer_names=tuple(f"{name}_l{j}" for j in range(num_layers)),
+        is_full_attention=kind == "full",
+        is_recurrent=kind == "mamba",
+        sliding_window_tokens=window,
+        worker_kv_bytes_per_block=bytes_per_block,
+        layer_pages=tuple(layer_pages),
+    )
+
+
 def make_offloading_config(
     *,
     tag: str,
     tp_size: int = 2,
     tokens_per_block: int = TOKENS_PER_BLOCK,
     blocks_per_chunk: int = 1,
-    worker_bytes_per_block: int = PAGE_BYTES * NUM_LAYERS,
+    tokens_per_hash: int = TOKENS_PER_BLOCK,
+    groups: Sequence[OffloadingGroupConfig] | None = None,
     cpu_bytes: int = 8 << 20,
-    groups: Sequence[tuple[int, bool]] | None = None,
     rank: int = 0,
     data_parallel_index: int = 0,
     replicated_layout: bool = False,
@@ -46,8 +68,7 @@ def make_offloading_config(
 ) -> OffloadingConfig:
     """An ``OffloadingConfig`` the way ``build_offloading_config`` would shape it.
 
-    ``groups`` is a list of (tokens_per_block, is_full_attention); the default
-    is one full-attention group.
+    The default is one full-attention group of two 4 KiB pages per block.
     """
     extra_config: dict[str, Any] = {
         "spec_name": "RadixShmemOffloadingSpec",
@@ -60,23 +81,16 @@ def make_offloading_config(
     if extra:
         extra_config.update(extra)
     if groups is None:
-        groups = [(tokens_per_block, True)]
+        groups = [group(tokens_per_block)]
     return OffloadingConfig(
-        groups=tuple(
-            OffloadingGroupConfig(
-                tokens_per_block=tpb,
-                layer_names=(f"g{i}_l{j}" for j in range(NUM_LAYERS)),
-                is_full_attention=full,
-            )
-            for i, (tpb, full) in enumerate(groups)
-        ),
-        worker_kv_bytes_per_block=worker_bytes_per_block,
+        groups=tuple(groups),
+        worker_kv_bytes_per_block=sum(g.worker_kv_bytes_per_block for g in groups),
         enable_kv_cache_events=False,
         extra_config=extra_config,
         engine_id=f"engine-{tag}-dp{data_parallel_index}",
         model=OffloadingModelConfig(name="test-model", dtype="float16"),
         cache=OffloadingCacheConfig(
-            tokens_per_hash=tokens_per_block, blocks_per_chunk=blocks_per_chunk
+            tokens_per_hash=tokens_per_hash, blocks_per_chunk=blocks_per_chunk
         ),
         parallel=OffloadingParallelConfig(
             rank=rank,
@@ -92,6 +106,16 @@ def make_offloading_config(
         ),
         replicated_layout=replicated_layout,
     )
+
+
+def hybrid_groups() -> list[OffloadingGroupConfig]:
+    """DeepSeek-V4 shaped: 32-token full-attention blocks over 16-token SWA
+    blocks with a 32-token window, so one SWA slot spans two SWA chunks and the
+    index window is a single FULL position."""
+    return [
+        group(32, kind="full", bytes_per_block=2 * PAGE_BYTES, name="full"),
+        group(16, kind="swa", window=32, bytes_per_block=PAGE_BYTES, name="swa"),
+    ]
 
 
 def geometry_for(config: OffloadingConfig) -> SlotGeometry:

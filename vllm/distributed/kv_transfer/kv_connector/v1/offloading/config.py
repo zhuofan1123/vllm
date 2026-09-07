@@ -10,11 +10,14 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
+    ChunkedLocalAttentionSpec,
     FullAttentionSpec,
     KVCacheSpec,
+    MambaSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
     SlidingWindowSpec,
+    UniformTypeKVCacheSpecs,
     is_full_attention_spec,
     iter_layer_specs,
 )
@@ -31,6 +34,40 @@ if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
 
+def _group_layer_specs(
+    layer_names: list[str], group_spec: KVCacheSpec
+) -> list[KVCacheSpec]:
+    if isinstance(group_spec, UniformTypeKVCacheSpecs):
+        specs = group_spec.kv_cache_specs
+        return [specs.get(name, group_spec.first_spec) for name in layer_names]
+    return [group_spec] * len(layer_names)
+
+
+def _sliding_window_tokens(spec: KVCacheSpec) -> int | None:
+    if isinstance(spec, SlidingWindowSpec):
+        return spec.sliding_window
+    if isinstance(spec, ChunkedLocalAttentionSpec):
+        return spec.attention_chunk_size
+    return None
+
+
+def _layer_placements(kv_cache_config: "KVCacheConfig") -> dict[str, tuple[int, int]]:
+    """(offset inside the packed block, page bytes) per layer for
+    block-outermost layouts; empty for layer-outermost ones."""
+    placements: dict[str, tuple[int, int]] = {}
+    for tensor in kv_cache_config.kv_cache_tensors:
+        num_blocks = kv_cache_config.num_blocks
+        # layer-outermost: each layer owns a contiguous region of num_blocks pages
+        if num_blocks > 1 and tensor.layer_stride >= tensor.block_stride * num_blocks:
+            return {}
+        for layer_idx, name in enumerate(tensor.layers):
+            placements[name] = (
+                tensor.offset + layer_idx * tensor.layer_stride,
+                tensor.layer_stride,
+            )
+    return placements
+
+
 def build_offloading_config(
     vllm_config: "VllmConfig",
     kv_cache_config: "KVCacheConfig",
@@ -43,6 +80,7 @@ def build_offloading_config(
     engine_id = kv_transfer_config.engine_id
 
     parallel_config = vllm_config.parallel_config
+    layer_placements = _layer_placements(kv_cache_config)
     groups = tuple(
         OffloadingGroupConfig(
             tokens_per_block=resolve_dcp_kv_block_size(
@@ -51,6 +89,17 @@ def build_offloading_config(
             ),
             layer_names=tuple(group.layer_names),
             is_full_attention=is_full_attention_spec(group.kv_cache_spec),
+            is_recurrent=isinstance(group.kv_cache_spec, MambaSpec),
+            sliding_window_tokens=_sliding_window_tokens(group.kv_cache_spec),
+            worker_kv_bytes_per_block=sum(
+                spec.page_size_bytes
+                for spec in _group_layer_specs(group.layer_names, group.kv_cache_spec)
+            ),
+            layer_pages=tuple(
+                layer_placements[name]
+                for name in group.layer_names
+                if name in layer_placements
+            ),
         )
         for group in kv_cache_config.kv_cache_groups
     )

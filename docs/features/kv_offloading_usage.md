@@ -89,6 +89,7 @@ still apply; `spec_name` is set for you):
 | `index_shm_name` / `data_shm_name` | `/vllm_kv_index` / `/vllm_kv_data` | Change both to run two independent caches on one host. |
 | `shm_role` | `auto` | `auto` attaches to a live owner and otherwise creates; `owner` / `attach` force one path. |
 | `replicated_kv` | vLLM's detection | Store one TP slice instead of `tp_size` when every rank holds identical KV bytes (MLA / MQA models). |
+| `full_slots` / `swa_slots` / `mamba_slots` | derived | Slot count per pool. The store has one pool per attention kind: full-attention groups share FULL slots, sliding-window / chunked-local groups SWA slots (one per full-attention chunk of tokens), Mamba groups MAMBA slots. Unset pools get as many slots as the FULL pool, all within `cpu_bytes_to_use`. |
 | `slot_align` | `4096` | Slot stride alignment in bytes (power of two). |
 | `hugepage_path` | — | Back the data region with hugetlbfs mounted here. |
 | `max_nodes` / `data_pool_ratio` | derived | Sizing of the shared radix index. |
@@ -96,8 +97,10 @@ still apply; `spec_name` is set for you):
 | `sentinel_dir` / `attach_timeout_s` | `/dev/shm` / `300` | Where the readiness sentinel lives and how long attachers wait for it. |
 | `force_reclaim` | `false` | With `shm_role=owner`, take over regions whose sentinel names a live pid. |
 
-Limits: `PP=1`, no context parallelism, single node, and `reset_prefix_cache`
-does not clear the shared index. With `--prefix-caching-hash-algo xxhash`,
+Limits: `PP=1`, no context parallelism, single node, `reset_prefix_cache`
+does not clear the shared index, and sliding windows wider than one
+full-attention chunk are published one position at a time (only the request's
+final window is loadable). With `--prefix-caching-hash-algo xxhash`,
 set the same `PYTHONHASHSEED` in every process or nothing can be shared.
 
 ## `kv_connector_extra_config` Reference

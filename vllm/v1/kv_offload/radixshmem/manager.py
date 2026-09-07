@@ -15,27 +15,28 @@ Two layers:
 * ``RadixShmemOffloadingManager`` adapts that to upstream's per-key
   ``OffloadingManager`` contract. The connector scheduler asks about one
   ``OffloadKey`` (block hash + KV group) at a time, while a radix tree only
-  matches root-anchored prefixes, so the manager rebuilds each request's per
-  group hash path from ``ReqContext.block_hashes`` and answers a whole step's
-  worth of lookups from one pinned query.
+  matches root-anchored prefixes, so the manager rebuilds each request's path
+  from ``ReqContext.block_hashes`` and answers a whole step's worth of lookups
+  from one pinned query.
 
-Group handling (all groups share one slot pool; a slot is one chunk of one
-group, see ``geometry.py``):
+The request's path is its sequence of full-attention chunk hashes; every KV
+cache group maps onto positions of that path (see ``geometry.py``):
 
-* full-attention groups are stored as radix *paths*: chunk ``i`` of group ``g``
-  is node ``i`` on the path ``[h(0,g), h(1,g), ...]``, so a prefix hit is one
-  query and LRU/pinning follow the tree;
-* windowed groups (sliding window, chunked local, Mamba) are stored *flat*, one
-  root child per chunk, because the connector only ever stores the last window
-  of them and a path with a missing prefix cannot be inserted.
+* FULL groups share one FULL slot per position (the slot holds all of their
+  tensors), published as a prefix run with ``insert(component=FULL)``;
+* SWA groups share one SWA slot per position, each holding the ``ratio`` SWA
+  chunks that fall into that position's token span, published with
+  ``insert(component=SWA)`` once every sub-chunk landed;
+* MAMBA groups get one MAMBA slot per position, ``insert(component=MAMBA)``.
 
-Group ``g`` is folded into the 64-bit key so the groups never collide in the
-one tree; group 0 is left unmixed so single-group models key exactly as before.
+SWA and MAMBA publishes need the FULL path below them, so a completed store
+publishes FULL first; anything the index rejects for a missing path is retried
+on later completions.
 """
 
 import time
 from collections import defaultdict
-from collections.abc import Collection, Iterable, Sequence
+from collections.abc import Collection, Iterable
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -55,17 +56,17 @@ from vllm.v1.kv_offload.base import (
     ReqContext,
     RequestOffloadingContext,
     ScheduleEndContext,
-    get_offload_block_hash,
     get_offload_group_idx,
     make_offload_key,
 )
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 
+from .geometry import GroupLayout, PoolKind, SlotGeometry
+
 logger = init_logger(__name__)
 
-# splitmix64 increment; mixed into the key for every group but the first
-_GROUP_MIX = np.uint64(0x9E3779B97F4A7C15)
-_U64_MASK = (1 << 64) - 1
+# a FULL_PATH_MISSING publish is retried on this many later completions
+_MAX_PUBLISH_RETRIES = 64
 
 
 class RadixShmemMetrics:
@@ -81,13 +82,12 @@ class RadixShmemMetrics:
     INDEX_TIME = "vllm:kv_offload_radixshmem_index_time"
 
 
-def to_u64(block_hashes: Iterable[bytes], group_idx: int = 0) -> np.ndarray:
+def to_u64(block_hashes: Iterable[bytes]) -> np.ndarray:
     """Reduce vLLM ``BlockHash`` bytes to the uint64 keys RadixShmem indexes on.
 
     vLLM's hash already folds in the parent hash, LoRA id, multimodal keys and
     cache salt, so truncation keeps the prefix semantics; it only shrinks the
-    collision space. The KV cache group is folded in so one tree can hold every
-    group's chunks. Every process attaching the same region must use exactly
+    collision space. Every process attaching the same region must use exactly
     this function.
     """
     hashes = list(block_hashes)
@@ -97,20 +97,44 @@ def to_u64(block_hashes: Iterable[bytes], group_idx: int = 0) -> np.ndarray:
     buf = bytearray(8 * n)
     for i, h in enumerate(hashes):
         buf[8 * i : 8 * i + 8] = h[:8]
-    arr = np.frombuffer(bytes(buf), dtype=np.uint64)
-    if group_idx:
-        arr = arr ^ np.uint64((group_idx * int(_GROUP_MIX)) & _U64_MASK)
-    return np.ascontiguousarray(arr, dtype=np.uint64)
+    return np.ascontiguousarray(np.frombuffer(bytes(buf), dtype=np.uint64))
+
+
+def _component(kind: int):
+    import shmradix
+
+    return shmradix.ComponentType(int(kind))
 
 
 class LookupLease:
-    """A pinned prefix hit: ``slots`` stay valid until ``release()``."""
+    """A pinned prefix hit: the slots stay valid until ``release()``."""
 
-    __slots__ = ("hit_blocks", "slots", "_finalize", "_owner", "_released")
+    __slots__ = (
+        "hit_blocks",
+        "slots",
+        "swa_start",
+        "swa_slots",
+        "mamba_slot",
+        "_finalize",
+        "_owner",
+        "_released",
+    )
 
-    def __init__(self, hit_blocks: int, slots: np.ndarray, finalize, owner):
+    def __init__(
+        self,
+        hit_blocks: int,
+        slots: np.ndarray,
+        swa_start: int,
+        swa_slots: np.ndarray,
+        mamba_slot: int | None,
+        finalize,
+        owner,
+    ):
         self.hit_blocks = hit_blocks
         self.slots = slots
+        self.swa_start = swa_start
+        self.swa_slots = swa_slots
+        self.mamba_slot = mamba_slot
         self._finalize = finalize
         self._owner = owner
         self._released = False
@@ -118,6 +142,11 @@ class LookupLease:
     @property
     def released(self) -> bool:
         return self._released
+
+    def swa_slot(self, position: int) -> int | None:
+        if self.swa_start <= position < self.hit_blocks and self.swa_slots.size:
+            return int(self.swa_slots[position - self.swa_start])
+        return None
 
     def release(self) -> None:
         """Drop the pin. Idempotent -- ``finalize`` is one-shot underneath."""
@@ -137,8 +166,10 @@ class LookupLease:
 class RadixIndex:
     """Ledger over one attached ``RadixClient`` (one per scheduler process)."""
 
-    def __init__(self, client):
+    def __init__(self, client, *, mask: int = PoolKind.FULL.mask):
         self.client = client
+        # components queried together: FULL plus whatever pools exist
+        self.mask = mask
         self._leases: set[LookupLease] = set()
         # counters, for logging and the connector's stats
         self.num_lookups = 0
@@ -161,13 +192,15 @@ class RadixIndex:
 
     @staticmethod
     def _hit_blocks(result) -> int:
-        """``common_hit`` of a Full-only query, or 0 when the request failed."""
+        """``common_hit`` of a query, or 0 when the request failed."""
         status = getattr(result, "status", None)
         if status is not None and int(status) != 0:
             return 0
         return int(result.common_hit)
 
-    def lookup(self, hashes: np.ndarray, *, touch: bool = False) -> int:
+    def lookup(
+        self, hashes: np.ndarray, *, touch: bool = False, mask: int | None = None
+    ) -> int:
         """Blocks of ``hashes`` (root-anchored) already in the shared cache.
 
         ``touch`` refreshes the LRU position of the hit; a plain probe does not.
@@ -175,7 +208,13 @@ class RadixIndex:
         if hashes.size == 0:
             return 0
         t0 = time.perf_counter()
-        r = self.client.query(hashes, local_only=True, lock=False, update_meta=touch)
+        r = self.client.query(
+            hashes,
+            mask=self.mask if mask is None else mask,
+            local_only=True,
+            lock=False,
+            update_meta=touch,
+        )
         self.time_query_s += time.perf_counter() - t0
         self.num_queries += 1
         return self._hit_blocks(r)
@@ -191,7 +230,9 @@ class RadixIndex:
         if hashes.size == 0:
             return None
         t0 = time.perf_counter()
-        r = self.client.query(hashes, local_only=True, lock=True, update_meta=True)
+        r = self.client.query(
+            hashes, mask=self.mask, local_only=True, lock=True, update_meta=True
+        )
         self.time_query_s += time.perf_counter() - t0
         self.num_queries += 1
         hit = self._hit_blocks(r)
@@ -210,9 +251,19 @@ class RadixIndex:
                 f"RadixShmem: query hit {hit} blocks but returned "
                 f"{slots.size} Full slots"
             )
-        slots = np.ascontiguousarray(slots[:hit], dtype=np.int32)
+        swa_slots = np.asarray(getattr(r, "swa_slots", ()), dtype=np.int32)
+        swa_start = int(getattr(r, "swa_start", hit)) if swa_slots.size else hit
+        mamba = getattr(r, "mamba", None)
+        lease = LookupLease(
+            hit,
+            np.ascontiguousarray(slots[:hit], dtype=np.int32),
+            swa_start,
+            swa_slots,
+            int(mamba[1]) if mamba is not None else None,
+            r.finalize,
+            self,
+        )
         self.num_hit_blocks += hit
-        lease = LookupLease(hit, slots, r.finalize, self)
         self._leases.add(lease)
         return lease
 
@@ -225,8 +276,8 @@ class RadixIndex:
 
     # -------------------------------------------------------- allocation
 
-    def allocate(self, n: int) -> np.ndarray | None:
-        """Reserve ``n`` slots, evicting unpinned LRU entries as needed.
+    def allocate(self, n: int, kind: int = PoolKind.FULL) -> np.ndarray | None:
+        """Reserve ``n`` slots of a pool, evicting unpinned LRU entries as needed.
 
         Returns ``None`` when the pool cannot satisfy the request -- every
         candidate is either pinned or freshly published. The caller must skip
@@ -235,22 +286,24 @@ class RadixIndex:
         if n <= 0:
             return np.empty(0, dtype=np.int32)
         t0 = time.perf_counter()
-        slots = self.client.allocate_slots(n)
+        slots = self.client.allocate_slots(n, component=_component(kind))
         self.time_alloc_s += time.perf_counter() - t0
         self.num_allocs += 1
         got = int(slots.size)
         if got < n:
             self.num_alloc_failures += 1
             if got:
-                self.client.recycle_slots(slots)
+                self.client.recycle_slots(slots, component=_component(kind))
             return None
         self.num_allocated += got
         return np.ascontiguousarray(slots, dtype=np.int32)
 
-    def recycle(self, slots: np.ndarray) -> None:
+    def recycle(self, slots: np.ndarray, kind: int = PoolKind.FULL) -> None:
         if slots is None or slots.size == 0:
             return
-        self.client.recycle_slots(np.ascontiguousarray(slots, dtype=np.int32))
+        self.client.recycle_slots(
+            np.ascontiguousarray(slots, dtype=np.int32), component=_component(kind)
+        )
         self.num_recycled += int(slots.size)
 
     # ----------------------------------------------------------- publish
@@ -258,7 +311,7 @@ class RadixIndex:
     def publish(
         self, hashes: np.ndarray, slots: np.ndarray, start: int
     ) -> tuple[int, np.ndarray]:
-        """Register ``slots`` for ``hashes[start:]`` after the data landed.
+        """Register FULL ``slots`` for ``hashes[start:]`` after the data landed.
 
         ``hashes`` is the full root-anchored prefix; ``slots`` covers the tail
         beginning at block ``start``. ``insert`` has three outcomes and all of
@@ -275,27 +328,52 @@ class RadixIndex:
         on, so the unused slots are already back in the pool; they are returned
         only so the caller can account for them.
         """
+        return self._insert(hashes, slots, start, PoolKind.FULL)
+
+    def publish_component(
+        self, hashes: np.ndarray, slots: np.ndarray, kind: int
+    ) -> tuple[int, str | None]:
+        """Publish SWA/MAMBA ``slots`` at the end of ``hashes``.
+
+        SWA takes the trailing ``min(W, n)`` positions' slots, MAMBA exactly one.
+        Returns ``(slots_published, error_name)``; ``error_name`` is set when the
+        index rejected the whole publish (e.g. ``FULL_PATH_MISSING``).
+        """
+        published, unused, error = self._insert_raw(hashes, slots, 0, kind)
+        if published <= 0 and error is not None and int(error) != 0:
+            return 0, getattr(error, "name", str(error))
+        return published, None
+
+    def _insert(
+        self, hashes: np.ndarray, slots: np.ndarray, start: int, kind: int
+    ) -> tuple[int, np.ndarray]:
+        published, unused, error = self._insert_raw(hashes, slots, start, kind)
+        if published <= 0 and error is not None and int(error) != 0:
+            logger.warning_once(
+                "RadixShmem insert failed (%s); the shared index may be full. "
+                "Raise max_nodes / data_pool_ratio if this persists.",
+                error,
+            )
+        return max(published, 0), unused
+
+    def _insert_raw(self, hashes, slots, start, kind):
         if slots.size == 0:
-            return 0, np.empty(0, dtype=np.int32)
+            return 0, np.empty(0, dtype=np.int32), None
         hashes = np.ascontiguousarray(hashes, dtype=np.uint64)
         slots = np.ascontiguousarray(slots, dtype=np.int32)
         t0 = time.perf_counter()
-        res = self.client.insert(hashes, slots, start=start, auto_recycle=True)
+        res = self.client.insert(
+            hashes, slots, start=start, auto_recycle=True, component=_component(kind)
+        )
         self.time_insert_s += time.perf_counter() - t0
         self.num_inserts += 1
         unused = res.unused_slots
         published = int(slots.size) - int(unused.size)
-        if int(res.error) != 0 and published == 0:
-            logger.warning_once(
-                "RadixShmem insert failed (%s); the shared index is full. "
-                "Raise max_nodes / data_pool_ratio if this persists.",
-                res.error,
-            )
         if published <= 0:
             self.num_publish_rejected += 1
-            return 0, unused
-        self.num_published += published
-        return published, unused
+        else:
+            self.num_published += published
+        return published, unused, res.error
 
     # ------------------------------------------------------------- misc
 
@@ -345,51 +423,28 @@ class RadixIndex:
 # ------------------------------------------------------------------ manager
 
 
-@dataclass(frozen=True)
-class GroupInfo:
-    """What the manager needs to know about one KV cache group."""
-
-    group_idx: int
-    # vLLM block hashes per offloaded chunk of this group
-    hashes_per_chunk: int
-    # sliding window / chunked local / Mamba: stored flat, not as a path
-    windowed: bool
-
-
-@dataclass
-class _GroupHits:
-    """One step's root-anchored lookup of a full-attention group."""
-
-    hit_blocks: int
-    # pinned hit; None once handed to a load (or when hit_blocks == 0)
-    lease: LookupLease | None
-
-
 @dataclass
 class _ReqState:
     """Per-request scratch, kept on the ReqContext and in ``_states``."""
 
-    # per group: mixed u64 path over the chunks known so far (immutable arrays;
-    # extending builds a new one, so older references stay valid prefixes)
-    paths: dict[int, np.ndarray] = field(default_factory=dict)
-    # per group: how many block hashes have been folded into `paths`/`chunk_idx`
+    # root-anchored u64 path over the FULL chunks known so far (immutable
+    # arrays; extending builds a new one, so older references stay valid)
+    path: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.uint64))
+    # per group: how many block hashes have been folded into `chunk_idx`
     indexed_hashes: dict[int, int] = field(default_factory=dict)
     # key -> chunk index within its group
     chunk_idx: dict[OffloadKey, int] = field(default_factory=dict)
-    # current step's pinned lookups
-    round_hits: dict[int, _GroupHits] = field(default_factory=dict)
-    flat_leases: dict[OffloadKey, LookupLease] = field(default_factory=dict)
+    # this step's pinned lookup, None once handed to a load or when nothing hit
+    lease: LookupLease | None = None
+    looked_up: bool = False
     # pins that back an in-flight load; released in complete_load
     load_leases: list[LookupLease] = field(default_factory=list)
 
     def release_round(self) -> None:
-        for hits in self.round_hits.values():
-            if hits.lease is not None:
-                hits.lease.release()
-        self.round_hits.clear()
-        for lease in self.flat_leases.values():
-            lease.release()
-        self.flat_leases.clear()
+        if self.lease is not None:
+            self.lease.release()
+        self.lease = None
+        self.looked_up = False
 
     def release_all(self) -> None:
         self.release_round()
@@ -398,16 +453,18 @@ class _ReqState:
         self.load_leases.clear()
 
 
-@dataclass(frozen=True)
-class _PendingStore:
-    """A slot reserved by prepare_store, published in complete_store."""
+@dataclass
+class _PendingSlot:
+    """A slot reserved by prepare_store, published once every part landed."""
 
-    group_idx: int
-    chunk_idx: int
+    kind: int
+    position: int
     slot: int
-    # root-anchored path (len >= chunk_idx + 1) for path groups; the single
-    # mixed key for flat groups
-    hashes: np.ndarray
+    path: np.ndarray  # root-anchored path with len >= position + 1
+    # (group, sub-chunk) parts still to be written into the slot
+    parts_left: set[tuple[int, int]]
+    keys: list[OffloadKey] = field(default_factory=list)
+    retries: int = 0
 
 
 class RadixShmemOffloadingManager(OffloadingManager):
@@ -416,17 +473,34 @@ class RadixShmemOffloadingManager(OffloadingManager):
     def __init__(
         self,
         regions,
-        groups: Sequence[GroupInfo],
+        geometry: SlotGeometry,
         *,
         enable_events: bool = False,
     ):
         self.regions = regions
-        self.index = RadixIndex(regions.client)
-        self.groups: dict[int, GroupInfo] = {g.group_idx: g for g in groups}
+        self.geometry = geometry
+        self.index = RadixIndex(regions.client, mask=geometry.pool_mask)
+        self.groups: dict[int, GroupLayout] = {g.group_idx: g for g in geometry.groups}
+        full = [g for g in geometry.groups if g.kind == PoolKind.FULL]
+        self._full_groups = frozenset(g.group_idx for g in full)
+        self._full_hashes_per_chunk = full[0].hashes_per_chunk
+        # parts one slot of each pool is made of: (group, sub-chunk) pairs
+        self._slot_parts: dict[int, frozenset[tuple[int, int]]] = {
+            kind: frozenset(
+                (g.group_idx, sub)
+                for g in geometry.groups
+                if g.kind == kind
+                for sub in range(g.ratio)
+            )
+            for kind in (PoolKind.FULL, PoolKind.SWA, PoolKind.MAMBA)
+        }
         self._states: dict[str, _ReqState] = {}
         # requests that pinned something this step and may need a sweep
         self._dirty: set[str] = set()
-        self._pending: dict[OffloadKey, _PendingStore] = {}
+        # (request, kind, position) -> reserved slot awaiting publish
+        self._pending: dict[tuple[str, int, int], _PendingSlot] = {}
+        # complete SWA/MAMBA slots the index rejected for a missing FULL path
+        self._retry: list[_PendingSlot] = []
         self._events: list[OffloadingEvent] | None = [] if enable_events else None
         self._stats_snapshot = self.index.stats()
 
@@ -441,7 +515,7 @@ class RadixShmemOffloadingManager(OffloadingManager):
         return state
 
     def _index_keys(self, state: _ReqState, req_context: ReqContext) -> None:
-        """Fold any new block hashes of the request into paths and key map."""
+        """Fold any new block hashes of the request into the path and key map."""
         block_hashes = req_context.block_hashes
         if block_hashes is None:
             raise RuntimeError(
@@ -450,44 +524,49 @@ class RadixShmemOffloadingManager(OffloadingManager):
             )
         num_hashes = len(block_hashes)
         for group in self.groups.values():
-            g = group.group_idx
             hpc = group.hashes_per_chunk
-            done = state.indexed_hashes.get(g, 0)
+            done = state.indexed_hashes.get(group.group_idx, 0)
             num_chunks = num_hashes // hpc
             first_chunk = done // hpc
             if num_chunks <= first_chunk:
                 continue
+            for i in range(first_chunk, num_chunks):
+                key = make_offload_key(block_hashes[(i + 1) * hpc - 1], group.group_idx)
+                state.chunk_idx[key] = i
+            state.indexed_hashes[group.group_idx] = num_chunks * hpc
+        hpc = self._full_hashes_per_chunk
+        num_positions = num_hashes // hpc
+        if num_positions > state.path.size:
             new_hashes = [
-                block_hashes[(i + 1) * hpc - 1] for i in range(first_chunk, num_chunks)
+                block_hashes[(p + 1) * hpc - 1]
+                for p in range(state.path.size, num_positions)
             ]
-            for i, h in enumerate(new_hashes, start=first_chunk):
-                state.chunk_idx[make_offload_key(h, g)] = i
-            new_u64 = to_u64(new_hashes, g)
-            old = state.paths.get(g)
-            state.paths[g] = new_u64 if old is None else np.concatenate([old, new_u64])
-            state.indexed_hashes[g] = num_chunks * hpc
+            state.path = np.concatenate([state.path, to_u64(new_hashes)])
 
     def _locate(
         self, state: _ReqState, req_context: ReqContext, key: OffloadKey
-    ) -> tuple[GroupInfo, int] | None:
-        """(group, chunk index) of ``key`` within this request, or None."""
+    ) -> tuple[GroupLayout, int, int] | None:
+        """(group, position on the path, sub-chunk) of ``key``, or None."""
         idx = state.chunk_idx.get(key)
         if idx is None:
             self._index_keys(state, req_context)
             idx = state.chunk_idx.get(key)
             if idx is None:
                 return None
-        return self.groups[get_offload_group_idx(key)], idx
-
-    @staticmethod
-    def _flat_key(key: OffloadKey) -> np.ndarray:
-        return to_u64([get_offload_block_hash(key)], get_offload_group_idx(key))
+        group = self.groups[get_offload_group_idx(key)]
+        return group, idx // group.ratio, idx % group.ratio
 
     # ------------------------------------------------------ OffloadingManager
 
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
         self._state(req_context)
         return RequestOffloadingContext()
+
+    def _round_lease(self, state: _ReqState) -> LookupLease | None:
+        if not state.looked_up:
+            state.lease = self.index.lookup_and_pin(state.path)
+            state.looked_up = True
+        return state.lease
 
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
         state = self._state(req_context)
@@ -496,82 +575,84 @@ class RadixShmemOffloadingManager(OffloadingManager):
             # not derived from this request's hashes (e.g. a boundary key of a
             # partial recurrent tail) -- never offloaded by this manager
             return LookupResult.MISS
-        group, idx = located
+        group, position, _ = located
         self._dirty.add(req_context.req_id)
-
-        if group.windowed:
-            if key in state.flat_leases:
-                return LookupResult.HIT
-            lease = self.index.lookup_and_pin(self._flat_key(key))
-            if lease is None:
-                return LookupResult.MISS
-            state.flat_leases[key] = lease
+        lease = self._round_lease(state)
+        if lease is None or position >= lease.hit_blocks:
+            return LookupResult.MISS
+        if group.kind == PoolKind.FULL:
             return LookupResult.HIT
-
-        hits = state.round_hits.get(group.group_idx)
-        if hits is None:
-            lease = self.index.lookup_and_pin(state.paths[group.group_idx])
-            hits = _GroupHits(
-                hit_blocks=lease.hit_blocks if lease is not None else 0, lease=lease
+        if group.kind == PoolKind.SWA:
+            return (
+                LookupResult.HIT
+                if lease.swa_slot(position) is not None
+                else LookupResult.MISS
             )
-            state.round_hits[group.group_idx] = hits
-        return LookupResult.HIT if idx < hits.hit_blocks else LookupResult.MISS
+        # MAMBA: only the checkpoint at the hit boundary is usable
+        return (
+            LookupResult.HIT
+            if lease.mamba_slot is not None and position == lease.hit_blocks - 1
+            else LookupResult.MISS
+        )
 
     def touch(self, keys: Collection[OffloadKey], req_context: ReqContext) -> None:
-        """Refresh the LRU position of the request's path groups.
-
-        Flat chunks are not touched: they are cheap to recompute and refreshing
-        them one query at a time would cost more than it saves.
-        """
+        """Refresh the LRU position of the request's path."""
         if not keys:
             return
         state = self._state(req_context)
-        deepest: dict[int, int] = {}
+        deepest = -1
         for key in keys:
             located = self._locate(state, req_context, key)
-            if located is None or located[0].windowed:
-                continue
-            g = located[0].group_idx
-            deepest[g] = max(deepest.get(g, -1), located[1])
-        for g, idx in deepest.items():
-            hits = state.round_hits.get(g)
-            if hits is not None and hits.hit_blocks >= idx + 1:
-                continue  # this step's pinned query already refreshed it
-            self.index.lookup(state.paths[g][: idx + 1], touch=True)
+            if located is not None:
+                deepest = max(deepest, located[1])
+        if deepest < 0:
+            return
+        lease = state.lease if state.looked_up else None
+        if lease is not None and lease.hit_blocks >= deepest + 1:
+            return  # this step's pinned query already refreshed it
+        self.index.lookup(state.path[: deepest + 1], touch=True)
 
     def prepare_load(
         self, keys: Collection[OffloadKey], req_context: ReqContext
     ) -> LoadStoreSpec:
         state = self._state(req_context)
+        lease = state.lease if state.looked_up else None
+        if lease is None:
+            raise RuntimeError(
+                "RadixShmem: load requested without a hit from this step's lookup"
+            )
         slots: list[int] = []
+        last: tuple[int, int] | None = None  # (group, position) just emitted
         for key in keys:
             located = self._locate(state, req_context, key)
             assert located is not None, f"load of a key foreign to the request: {key!r}"
-            group, idx = located
-            if group.windowed:
-                lease = state.flat_leases.pop(key, None)
-                if lease is None:
-                    # lookup happened in an earlier step and was swept; re-pin
-                    lease = self.index.lookup_and_pin(self._flat_key(key))
-                    if lease is None:
-                        raise RuntimeError(
-                            "RadixShmem: chunk evicted between lookup and load"
-                        )
-                state.load_leases.append(lease)
-                slots.append(int(lease.slots[0]))
-                continue
-            hits = state.round_hits.get(group.group_idx)
-            if hits is None or hits.hit_blocks <= idx:
+            group, position, _ = located
+            if position >= lease.hit_blocks:
                 raise RuntimeError(
-                    f"RadixShmem: load of chunk {idx} (group {group.group_idx}) "
-                    "that this step's lookup did not report as a hit"
+                    f"RadixShmem: load of position {position} beyond the hit "
+                    f"({lease.hit_blocks})"
                 )
-            lease = hits.lease
-            if lease is not None:
-                # the pin moves to the load; the sweep must not release it
-                state.load_leases.append(lease)
-                hits.lease = None
-            slots.append(int(state.load_leases[-1].slots[idx]))
+            if group.kind == PoolKind.FULL:
+                slot = int(lease.slots[position])
+            elif group.kind == PoolKind.SWA:
+                # one slot per position; the connector lists every sub-chunk key
+                if last == (group.group_idx, position):
+                    continue
+                swa = lease.swa_slot(position)
+                if swa is None:
+                    raise RuntimeError(
+                        f"RadixShmem: SWA position {position} was not a hit"
+                    )
+                slot = swa
+            else:
+                if lease.mamba_slot is None or position != lease.hit_blocks - 1:
+                    raise RuntimeError("RadixShmem: MAMBA checkpoint was not a hit")
+                slot = lease.mamba_slot
+            slots.append(slot)
+            last = (group.group_idx, position)
+        # the pin moves to the load; the sweep must not release it
+        state.load_leases.append(lease)
+        state.lease = None
         return CPULoadStoreSpec(slots)
 
     def complete_load(
@@ -586,56 +667,56 @@ class RadixShmemOffloadingManager(OffloadingManager):
         self, keys: Collection[OffloadKey], req_context: ReqContext
     ) -> PrepareStoreOutput | None:
         state = self._state(req_context)
-        by_group: dict[int, list[tuple[int, OffloadKey]]] = defaultdict(list)
+        req_id = req_context.req_id
+        located_keys: list[tuple[OffloadKey, GroupLayout, int, int]] = []
         for key in keys:
             located = self._locate(state, req_context, key)
-            if located is None:
-                continue  # cannot place a key we cannot anchor
-            by_group[located[0].group_idx].append((located[1], key))
+            if located is not None:
+                located_keys.append((key, *located))
+        if not located_keys:
+            return PrepareStoreOutput([], CPULoadStoreSpec([]), [])
+
+        # FULL positions already published by anyone are skipped; the index
+        # only accepts FULL publishes as prefix extensions, so this is a probe
+        # of the path up to the deepest FULL key
+        full_positions = [p for _, g, p, _ in located_keys if g.kind == PoolKind.FULL]
+        already = (
+            self.index.lookup(
+                state.path[: max(full_positions) + 1], mask=PoolKind.FULL.mask
+            )
+            if full_positions
+            else 0
+        )
 
         keys_to_store: list[OffloadKey] = []
         slots_out: list[int] = []
         allocation_failed = False
-        for g, items in by_group.items():
-            group = self.groups[g]
-            items.sort()
-            if group.windowed:
-                for idx, key in items:
-                    if key in self._pending:
-                        continue
-                    flat = self._flat_key(key)
-                    if self.index.lookup(flat) > 0:
-                        continue  # a peer already published it
-                    slots = self.index.allocate(1)
-                    if slots is None:
-                        allocation_failed = True
-                        break
-                    self._pending[key] = _PendingStore(g, idx, int(slots[0]), flat)
-                    keys_to_store.append(key)
-                    slots_out.append(int(slots[0]))
+        last: tuple[int, int] | None = None
+        for key, group, position, sub in located_keys:
+            if group.kind == PoolKind.FULL and position < already:
                 continue
-
-            path = state.paths[g]
-            end = items[-1][0] + 1
-            assert end <= path.size
-            # somebody else may have published part of this prefix already;
-            # only move the bytes that are genuinely missing
-            already = self.index.lookup(path[:end])
-            wanted = [
-                (idx, key)
-                for idx, key in items
-                if idx >= already and key not in self._pending
-            ]
-            if not wanted:
-                continue
-            slots = self.index.allocate(len(wanted))
-            if slots is None:
-                allocation_failed = True
-                continue
-            for (idx, key), slot in zip(wanted, slots):
-                self._pending[key] = _PendingStore(g, idx, int(slot), path)
-                keys_to_store.append(key)
-                slots_out.append(int(slot))
+            pending_key = (req_id, group.kind, position)
+            pending = self._pending.get(pending_key)
+            if pending is None:
+                slots = self.index.allocate(1, group.kind)
+                if slots is None:
+                    allocation_failed = True
+                    break
+                pending = _PendingSlot(
+                    kind=group.kind,
+                    position=position,
+                    slot=int(slots[0]),
+                    path=state.path,
+                    parts_left=set(self._slot_parts[group.kind]),
+                )
+                self._pending[pending_key] = pending
+            pending.keys.append(key)
+            keys_to_store.append(key)
+            # one CPU slot per (group, position): the connector's handler
+            # expands it into the group's sub-blocks itself
+            if last != (group.group_idx, position):
+                slots_out.append(pending.slot)
+            last = (group.group_idx, position)
 
         if allocation_failed and not keys_to_store:
             return None
@@ -651,69 +732,106 @@ class RadixShmemOffloadingManager(OffloadingManager):
         req_context: ReqContext,
         success: bool = True,
     ) -> None:
-        pending: list[tuple[OffloadKey, _PendingStore]] = []
+        state = self._state(req_context)
+        req_id = req_context.req_id
+        completed: list[_PendingSlot] = []
         for key in keys:
-            entry = self._pending.pop(key, None)
-            if entry is not None:
-                pending.append((key, entry))
-        if not pending:
+            located = self._locate(state, req_context, key)
+            if located is None:
+                continue
+            group, position, sub = located
+            pending = self._pending.get((req_id, group.kind, position))
+            if pending is None:
+                continue
+            pending.parts_left.discard((group.group_idx, sub))
+            if not pending.parts_left and pending not in completed:
+                completed.append(pending)
+                del self._pending[(req_id, group.kind, position)]
+        if not completed:
             return
         if not success:
-            self.index.recycle(np.array([p.slot for _, p in pending], dtype=np.int32))
+            for pending in completed:
+                self.index.recycle(
+                    np.array([pending.slot], dtype=np.int32), pending.kind
+                )
             return
 
-        by_group: dict[int, list[tuple[OffloadKey, _PendingStore]]] = defaultdict(list)
-        for key, entry in pending:
-            by_group[entry.group_idx].append((key, entry))
-
         stored: list[OffloadKey] = []
-        for g, entries in by_group.items():
-            entries.sort(key=lambda e: e[1].chunk_idx)
-            if self.groups[g].windowed:
-                for key, entry in entries:
-                    published, _ = self.index.publish(
-                        entry.hashes, np.array([entry.slot], dtype=np.int32), 0
-                    )
-                    if published:
-                        stored.append(key)
-                continue
-            # publish maximal runs of consecutive chunks in one insert each
-            run: list[tuple[OffloadKey, _PendingStore]] = []
-            for item in entries:
-                if run and (
-                    item[1].chunk_idx != run[-1][1].chunk_idx + 1
-                    or item[1].hashes is not run[-1][1].hashes
-                ):
-                    stored.extend(self._publish_run(run))
-                    run = []
-                run.append(item)
-            if run:
-                stored.extend(self._publish_run(run))
+        # FULL first: the other components hang on the FULL path
+        full = sorted(
+            (p for p in completed if p.kind == PoolKind.FULL), key=lambda p: p.position
+        )
+        run: list[_PendingSlot] = []
+        for item in full:
+            if run and (
+                item.position != run[-1].position + 1 or item.path is not run[-1].path
+            ):
+                stored.extend(self._publish_full_run(run))
+                run = []
+            run.append(item)
+        if run:
+            stored.extend(self._publish_full_run(run))
+
+        others = [p for p in completed if p.kind != PoolKind.FULL] + self._retry
+        self._retry = []
+        for pending in others:
+            stored.extend(self._publish_component(pending))
 
         if self._events is not None and stored:
             self._events.append(
                 OffloadingEvent(keys=stored, medium=Medium.CPU, removed=False)
             )
 
-    def _publish_run(
-        self, run: list[tuple[OffloadKey, _PendingStore]]
-    ) -> list[OffloadKey]:
-        first = run[0][1]
-        last = run[-1][1]
-        slots = np.array([p.slot for _, p in run], dtype=np.int32)
+    def _publish_full_run(self, run: list[_PendingSlot]) -> list[OffloadKey]:
+        first, last = run[0], run[-1]
+        slots = np.array([p.slot for p in run], dtype=np.int32)
         published, _ = self.index.publish(
-            first.hashes[: last.chunk_idx + 1], slots, first.chunk_idx
+            first.path[: last.position + 1], slots, first.position
         )
         if published < len(run):
             logger.debug(
-                "RadixShmem: published %d of %d chunks starting at %d (the rest "
-                "was already present, or the prefix below was evicted)",
+                "RadixShmem: published %d of %d FULL chunks from position %d (the "
+                "rest was already present, or the prefix below was evicted)",
                 published,
                 len(run),
-                first.chunk_idx,
+                first.position,
             )
         # publish() keeps the tail: the leading (len - published) were redundant
-        return [key for key, _ in run[len(run) - published :]]
+        return [key for p in run[len(run) - published :] for key in p.keys]
+
+    def _publish_component(self, pending: _PendingSlot) -> list[OffloadKey]:
+        n = pending.position + 1
+        if pending.kind == PoolKind.SWA and self.geometry.swa_window_blocks > 1:
+            # the index publishes a whole trailing window at once; only the
+            # single-position window (window <= one FULL chunk) is supported
+            # per slot here, larger windows need every slot of the window
+            window = self.geometry.swa_window_blocks
+            logger.warning_once(
+                "RadixShmem: SWA windows spanning %d FULL chunks are published one "
+                "position at a time; positions below the request end will not be "
+                "loadable from this store",
+                window,
+            )
+        slots = np.array([pending.slot], dtype=np.int32)
+        published, error = self.index.publish_component(
+            pending.path[:n], slots, pending.kind
+        )
+        if published:
+            return pending.keys
+        if error == "FULL_PATH_MISSING" and pending.retries < _MAX_PUBLISH_RETRIES:
+            # the FULL chunks below are still in flight in another job
+            pending.retries += 1
+            self._retry.append(pending)
+            return []
+        if error is not None:
+            logger.debug(
+                "RadixShmem: %s publish at position %d rejected (%s)",
+                PoolKind(pending.kind).name,
+                pending.position,
+                error,
+            )
+        # rejected for good, or a peer's slot won: ours came back via auto_recycle
+        return []
 
     def on_schedule_end(self, context: ScheduleEndContext) -> None:
         """Drop every pin taken this step that did not turn into a load."""
@@ -780,11 +898,13 @@ class RadixShmemOffloadingManager(OffloadingManager):
             state.release_all()
         self._states.clear()
         self._dirty.clear()
-        if self._pending:
-            self.index.recycle(
-                np.array([p.slot for p in self._pending.values()], dtype=np.int32)
-            )
-            self._pending.clear()
+        by_kind: dict[int, list[int]] = defaultdict(list)
+        for pending in list(self._pending.values()) + self._retry:
+            by_kind[pending.kind].append(pending.slot)
+        self._pending.clear()
+        self._retry.clear()
+        for kind, slots in by_kind.items():
+            self.index.recycle(np.array(slots, dtype=np.int32), kind)
 
     def shutdown(self) -> None:
         self.release_all()

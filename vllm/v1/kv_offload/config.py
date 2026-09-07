@@ -19,6 +19,18 @@ class OffloadingGroupConfig:
     # trailing window of them is ever offloaded, so backends that key by
     # prefix cannot chain their chunks.
     is_full_attention: bool = True
+    # True for recurrent-state groups (Mamba): one state per chunk, no window.
+    is_recurrent: bool = False
+    # Attention span in tokens for windowed groups (sliding window / chunked
+    # local attention); None for full attention and recurrent groups.
+    sliding_window_tokens: int | None = None
+    # KV bytes one worker holds per block for this group's layers.
+    worker_kv_bytes_per_block: int = 0
+    # Block-outermost (packed) layouts only: (byte offset inside the packed
+    # block, page bytes) per layer, in layer_names order. Empty when each layer
+    # has its own contiguous region, in which case the canonical tensors
+    # already are per layer.
+    layer_pages: tuple[tuple[int, int], ...] = ()
 
 
 @dataclass(frozen=True)

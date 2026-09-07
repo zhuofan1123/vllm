@@ -39,6 +39,7 @@ from .geometry import (
     DEFAULT_ATTACH_TIMEOUT_S,
     DEFAULT_SENTINEL_DIR,
     GeometryMismatch,
+    PoolKind,
     SlotGeometry,
 )
 
@@ -146,8 +147,12 @@ class SharedRegions:
         self.server = None
 
     def data_view(self) -> memoryview:
-        """Writable view over the whole registerable data range (slot 0..N)."""
+        """Writable view over the whole registerable data range (all pools)."""
         return self.store.data_view()
+
+    def pool_view(self, kind: int) -> memoryview:
+        """Writable view over one pool (num_slots x slot_stride)."""
+        return self.store.pool_view(int(kind))
 
     @property
     def data_ptr(self) -> int:
@@ -161,14 +166,25 @@ def _make_shm_config(geometry: SlotGeometry, extra: dict[str, Any]) -> Any:
     shmradix, _ = _import_shmradix()
     # The node pool is not grown on demand and overflowing it is a segfault, not
     # an exception, so size it explicitly rather than relying on the default.
-    max_nodes = int(extra.get("max_nodes") or (2 * geometry.num_slots + 1024))
+    full = geometry.require_pool(PoolKind.FULL)
+    max_nodes = int(extra.get("max_nodes") or (2 * full.num_slots + 1024))
     if max_nodes >= 2**32:
         raise ValueError(f"max_nodes ({max_nodes}) exceeds the uint32 node id space")
     cfg = shmradix.ShmConfig()
     cfg.max_nodes = max_nodes
-    cfg.max_blocks = geometry.num_slots
+    cfg.max_blocks = full.num_slots
     cfg.block_size = geometry.tokens_per_chunk
     cfg.hugepage_path = geometry.hugepage_path
+    # the index's three slot-id spaces mirror the store's three pools
+    cfg.component_mask = geometry.pool_mask
+    swa = geometry.pool(PoolKind.SWA)
+    if swa is not None:
+        cfg.swa_max_blocks = swa.num_slots
+        cfg.swa_window_blocks = geometry.swa_window_blocks
+    mamba = geometry.pool(PoolKind.MAMBA)
+    if mamba is not None:
+        cfg.mamba_max_slots = mamba.num_slots
+        cfg.mamba_state_bytes = mamba.slot_stride
     if "data_pool_ratio" in extra:
         cfg.data_pool_ratio = float(extra["data_pool_ratio"])
     if "background_evict_ratio" in extra:
@@ -266,13 +282,23 @@ def create_regions(
     server = shmradix.RadixServer(geometry.index_shm_name, shm_cfg)
     client = shmradix.RadixClient(server)
 
-    store_cfg = shmradix_data.SlotStoreConfig()
-    store_cfg.name = geometry.data_shm_name
-    store_cfg.full.num_slots = geometry.num_slots
-    store_cfg.full.slot_bytes = geometry.slot_bytes
-    store_cfg.slot_align = geometry.slot_align
-    store_cfg.hugepage_path = geometry.hugepage_path
-    store_cfg.prefault = bool(extra.get("prefault", True))
+    def pool_cfg(kind: PoolKind):
+        pool = geometry.pool(kind)
+        if pool is None:
+            return shmradix_data.SlotPoolConfig()
+        # the stride is what the store rounds to anyway; passing it keeps the
+        # index's mamba_state_bytes and the store's slot_bytes identical
+        return shmradix_data.SlotPoolConfig(pool.num_slots, pool.slot_stride)
+
+    store_cfg = shmradix_data.SlotStoreConfig(
+        name=geometry.data_shm_name,
+        full=pool_cfg(PoolKind.FULL),
+        swa=pool_cfg(PoolKind.SWA),
+        mamba=pool_cfg(PoolKind.MAMBA),
+        slot_align=geometry.slot_align,
+        hugepage_path=geometry.hugepage_path,
+        prefault=bool(extra.get("prefault", True)),
+    )
     t0 = time.monotonic()
     store = shmradix_data.SlotStore.create(store_cfg)
     create_s = time.monotonic() - t0
@@ -292,19 +318,17 @@ def create_regions(
     atexit.register(regions.close)
 
     logger.info(
-        "RadixShmem owner ready: index=%s (max_blocks=%d, max_nodes=%d, "
-        "tokens_per_chunk=%d) data=%s (%d slots x %d B stride = %.2f GiB, "
-        "%d slice(s) of %d B per slot, created in %.1fs) sentinel=%s",
+        "RadixShmem owner ready: index=%s (max_nodes=%d, tokens_per_chunk=%d, "
+        "swa_window_blocks=%d) data=%s (%s; %d slice(s); %.2f GiB, created in "
+        "%.1fs) sentinel=%s",
         geometry.index_shm_name,
-        geometry.num_slots,
         shm_cfg.max_nodes,
         geometry.tokens_per_chunk,
+        geometry.swa_window_blocks,
         geometry.data_shm_name,
-        geometry.num_slots,
-        geometry.slot_stride,
-        geometry.total_data_bytes / 2**30,
+        describe_pools(geometry),
         geometry.num_slices,
-        geometry.slice_bytes,
+        geometry.total_data_bytes / 2**30,
         create_s,
         sentinel,
     )
@@ -357,12 +381,11 @@ def attach_regions(
         )
 
     logger.info(
-        "RadixShmem %s attached: index=%s data=%s (%d slots x %d B, owner pid %d)",
+        "RadixShmem %s attached: index=%s data=%s (%s, owner pid %d)",
         role,
         geometry.index_shm_name,
         geometry.data_shm_name,
-        store.num_slots,
-        store.slot_bytes,
+        describe_pools(geometry),
         owner_pid,
     )
     return SharedRegions(
@@ -374,39 +397,44 @@ def attach_regions(
     )
 
 
+def describe_pools(geometry: SlotGeometry) -> str:
+    return ", ".join(
+        f"{PoolKind(p.kind).name} {p.num_slots} x {p.slot_stride} B"
+        for p in geometry.pools
+    )
+
+
 def _check_attached(geometry: SlotGeometry, client: Any, store: Any) -> None:
     """Cross-check the two regions against each other and the geometry."""
-    if store.num_slots != geometry.num_slots:
+    shmradix, _ = _import_shmradix()
+    if int(store.pool_mask) != geometry.pool_mask:
         raise GeometryMismatch(
-            f"SlotStore has {store.num_slots} slots, geometry says {geometry.num_slots}"
+            f"SlotStore has pools {int(store.pool_mask):#x}, geometry says "
+            f"{geometry.pool_mask:#x}"
         )
-    if store.slot_bytes != geometry.slot_stride:
-        raise GeometryMismatch(
-            f"SlotStore stride is {store.slot_bytes} B, geometry says "
-            f"{geometry.slot_stride} B (slot_align={geometry.slot_align})"
-        )
-    if store.slot_bytes < geometry.slot_bytes:
-        raise GeometryMismatch(
-            f"SlotStore stride {store.slot_bytes} B cannot hold one slot "
-            f"({geometry.slot_bytes} B)"
-        )
-    mempool_total = client.mempool_total()
-    if mempool_total != geometry.num_slots:
-        raise GeometryMismatch(
-            f"index mempool has {mempool_total} slots, SlotStore has "
-            f"{geometry.num_slots}; slot ids would run off the data region"
-        )
+    for pool in geometry.pools:
+        kind = PoolKind(pool.kind)
+        actual = store.pool(int(kind))
+        if actual.num_slots != pool.num_slots:
+            raise GeometryMismatch(
+                f"SlotStore {kind.name} pool has {actual.num_slots} slots, geometry "
+                f"says {pool.num_slots}"
+            )
+        if actual.slot_bytes != pool.slot_stride:
+            raise GeometryMismatch(
+                f"SlotStore {kind.name} stride is {actual.slot_bytes} B, geometry "
+                f"says {pool.slot_stride} B (slot_align={geometry.slot_align})"
+            )
+    try:
+        # index slot-id spaces vs store pools, pool by pool
+        shmradix.check_pools_aligned(client, store)
+    except ValueError as e:
+        raise GeometryMismatch(f"RadixShmem: {e}") from e
     if client.block_size() != geometry.tokens_per_chunk:
         raise GeometryMismatch(
             f"index block_size is {client.block_size()} tokens, geometry says "
             f"{geometry.tokens_per_chunk}"
         )
-    # pool by pool: the index's FULL/SWA/MAMBA capacities vs the store's pools
-    shmradix, _ = _import_shmradix()
-    try:
-        shmradix.check_pools_aligned(client, store)
-    except ValueError as e:
-        raise GeometryMismatch(str(e)) from e
     if geometry.hugepage_path and not store.is_hugepage:
         raise GeometryMismatch(
             f"hugepage_path={geometry.hugepage_path!r} was requested but the "

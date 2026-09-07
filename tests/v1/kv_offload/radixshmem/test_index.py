@@ -64,15 +64,6 @@ def test_to_u64_empty():
     assert to_u64([]).shape == (0,)
 
 
-def test_to_u64_folds_the_group_index():
-    h = [bytes(range(32))]
-    assert to_u64(h, 0)[0] == to_u64(h)[0]
-    assert to_u64(h, 1)[0] != to_u64(h)[0]
-    assert to_u64(h, 1)[0] != to_u64(h, 2)[0]
-    # deterministic, so every process derives the same keys
-    assert to_u64(h, 3)[0] == to_u64(h, 3)[0]
-
-
 # ------------------------------------------------------------------- basic flow
 
 

@@ -12,6 +12,10 @@ derives the geometry from config, creates both shared regions, and publishes a
 sentinel; every other scheduler and every TP worker waits for that sentinel and
 attaches, refusing to run if its own geometry disagrees.
 
+The SlotStore has one pool per attention kind (FULL / SWA / MAMBA), sized from
+the KV cache groups; SWA and Mamba chunks go through the index's own components
+rather than sharing the full-attention slots (see ``geometry.py``).
+
 Selected with ``--kv-offloading-backend radixshmem``; ``--kv-offloading-size``
 is then the budget for the *whole node*, not per rank or per instance. Optional
 knobs in ``kv_connector_extra_config``:
@@ -22,9 +26,11 @@ knobs in ``kv_connector_extra_config``:
   ``owner`` or ``attach``;
 * ``replicated_kv``: store one TP slice instead of ``tp_size`` when every rank
   holds identical KV bytes (MLA / MQA models); defaults to vLLM's detection;
+* ``full_slots`` / ``swa_slots`` / ``mamba_slots``: slot counts per pool;
+  unset pools get as many slots as the FULL pool within ``cpu_bytes_to_use``;
 * ``block_size`` / ``blocks_per_chunk``, ``slot_align``, ``hugepage_path``,
-  ``max_nodes``, ``data_pool_ratio``, ``sentinel_dir``, ``attach_timeout_s``,
-  ``force_reclaim``, ``prefault``.
+  ``max_nodes``, ``data_pool_ratio``, ``background_evict_ratio``,
+  ``sentinel_dir``, ``attach_timeout_s``, ``force_reclaim``, ``prefault``.
 
 Limits: ``PP=1``, no context parallelism, one node, and ``reset_prefix_cache``
 does not clear the shared index.
@@ -52,7 +58,7 @@ from .geometry import (
     SlotGeometry,
     compute_geometry,
 )
-from .manager import GroupInfo, RadixShmemMetrics, RadixShmemOffloadingManager
+from .manager import RadixShmemMetrics, RadixShmemOffloadingManager
 from .worker import RadixShmemOffloadingWorker
 
 logger = init_logger(__name__)
@@ -128,16 +134,6 @@ class RadixShmemOffloadingSpec(OffloadingSpec):
             extra.get("attach_timeout_s", DEFAULT_ATTACH_TIMEOUT_S)
         )
         self._extra = extra
-        self.groups: tuple[GroupInfo, ...] = tuple(
-            GroupInfo(
-                group_idx=idx,
-                hashes_per_chunk=(group.tokens_per_block * self.blocks_per_chunk)
-                // self.tokens_per_hash,
-                # sliding window / chunked local / Mamba chunks are stored flat
-                windowed=not group.is_full_attention,
-            )
-            for idx, group in enumerate(config.groups)
-        )
 
     # ---------------------------------------------------------- scheduler
 
@@ -159,7 +155,7 @@ class RadixShmemOffloadingSpec(OffloadingSpec):
         )
         return RadixShmemOffloadingManager(
             regions,
-            self.groups,
+            self.geometry,
             enable_events=self.kv_events_config.enable_kv_cache_events,
         )
 
@@ -177,8 +173,4 @@ class RadixShmemOffloadingSpec(OffloadingSpec):
             )
             return regions, rank
 
-        return RadixShmemOffloadingWorker(
-            attach=attach,
-            kv_caches=kv_caches,
-            blocks_per_chunk=self.blocks_per_chunk,
-        )
+        return RadixShmemOffloadingWorker(attach=attach, kv_caches=kv_caches)

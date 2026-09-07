@@ -5,7 +5,8 @@
 Drives the ``OffloadingManager`` contract the way the upstream offloading
 connector scheduler does: per-key lookups, ``prepare_load`` / ``complete_load``
 around a load, ``prepare_store`` / ``complete_store`` around a store, and the
-``on_schedule_end`` sweep between steps.
+``on_schedule_end`` sweep between steps. The hybrid fixture is DeepSeek-V4
+shaped (see ``hybrid_groups``): one SWA slot spans two SWA chunks.
 """
 
 import numpy as np
@@ -17,14 +18,13 @@ from vllm.v1.kv_offload.base import (
     make_offload_key,
 )
 from vllm.v1.kv_offload.radixshmem.bootstrap import attach_regions, create_regions
-from vllm.v1.kv_offload.radixshmem.manager import (
-    GroupInfo,
-    RadixShmemOffloadingManager,
-)
+from vllm.v1.kv_offload.radixshmem.geometry import PoolKind
+from vllm.v1.kv_offload.radixshmem.manager import RadixShmemOffloadingManager
 
 from .utils import (
     block_hashes,
     geometry_for,
+    hybrid_groups,
     keys_for,
     make_offloading_config,
     req_context,
@@ -32,14 +32,17 @@ from .utils import (
 )
 
 STEP = ScheduleEndContext(new_req_ids=(), preempted_req_ids=())
-FULL = GroupInfo(group_idx=0, hashes_per_chunk=1, windowed=False)
-SWA = GroupInfo(group_idx=1, hashes_per_chunk=1, windowed=True)
 
 
 @pytest.fixture
 def regions(request):
-    extra = getattr(request, "param", None) or {}
-    config = make_offloading_config(tag=unique_tag(request), tp_size=2, extra=extra)
+    param = getattr(request, "param", None) or {}
+    config = make_offloading_config(
+        tag=unique_tag(request),
+        tp_size=2,
+        groups=param.get("groups"),
+        extra=param.get("extra"),
+    )
     r = create_regions(geometry_for(config), dict(config.extra_config))
     yield r
     r.close()
@@ -47,14 +50,14 @@ def regions(request):
 
 @pytest.fixture
 def manager(regions):
-    m = RadixShmemOffloadingManager(regions, [FULL])
+    m = RadixShmemOffloadingManager(regions, regions.geometry)
     yield m
     m.release_all()
     m.index.close()
 
 
 def store(manager, ctx, keys, *, success=True):
-    """prepare_store -> (workers copy) -> complete_store; returns the slots."""
+    """prepare_store -> (workers copy) -> complete_store; returns the output."""
     out = manager.prepare_store(keys, ctx)
     assert out is not None
     manager.complete_store(out.keys_to_store, ctx, success=success)
@@ -161,8 +164,6 @@ def test_keys_foreign_to_the_request_are_misses(manager):
 def test_load_pins_until_complete_load(manager):
     hashes = block_hashes(4)
     store(manager, req_context("a", hashes), keys_for(hashes))
-    stored_slots = list(manager.prepare_load([], req_context("x", [])).block_ids)
-    assert stored_slots == []
 
     b = req_context("b", hashes)
     keys = keys_for(hashes)
@@ -230,53 +231,115 @@ def test_hashes_growing_between_steps_extend_the_path(manager):
     manager.on_schedule_end(STEP)
 
 
-# --------------------------------------------------------------- windowed group
+# --------------------------------------------------------------- hybrid (SWA)
+
+HYBRID = {"groups": hybrid_groups()}
 
 
-@pytest.fixture
-def hybrid_manager(regions):
-    m = RadixShmemOffloadingManager(regions, [FULL, SWA])
-    yield m
-    m.release_all()
-    m.index.close()
+def hybrid_keys(hashes):
+    """(full keys, swa keys) for a hybrid request; 2 hashes per FULL chunk."""
+    return keys_for(hashes, 0, hashes_per_chunk=2), keys_for(hashes, 1)
 
 
-def test_windowed_group_stores_flat_and_hits_per_key(hybrid_manager):
-    m = hybrid_manager
-    hashes = block_hashes(6)
+@pytest.mark.parametrize("regions", [HYBRID], indirect=True)
+def test_swa_window_is_stored_in_its_own_pool_and_hits_per_position(manager):
+    hashes = block_hashes(8)  # 4 FULL positions, 8 SWA chunks
     a = req_context("a", hashes)
-    full_keys = keys_for(hashes, group_idx=0)
-    swa_keys = keys_for(hashes, group_idx=1)
-    # the connector stores the full group whole but only the SWA tail
-    store(m, a, full_keys + swa_keys[4:])
+    full_keys, swa_keys = hybrid_keys(hashes)
+    swa_before = manager.regions.client.swa_mempool_total()
+    # the connector stores the whole FULL group and the SWA tail window
+    # (chunks 6, 7 == position 3)
+    out = store(manager, a, full_keys + swa_keys[6:])
+    assert out.keys_to_store == full_keys + swa_keys[6:]
+    # one CPU slot per (group, position): 4 FULL + 1 SWA
+    assert len(out.store_spec.block_ids) == 5
+    assert manager.regions.client.mempool_used() == 4  # FULL pool
+    assert manager.regions.client.swa_mempool_total() == swa_before
 
     b = req_context("b", hashes)
-    assert lookups(m, b, full_keys) == [LookupResult.HIT] * 6
-    assert lookups(m, b, swa_keys) == [LookupResult.MISS] * 4 + [LookupResult.HIT] * 2
-    spec = m.prepare_load(full_keys[2:] + swa_keys[4:], b)
-    assert len(spec.block_ids) == 6
-    m.complete_load(full_keys[2:] + swa_keys[4:], b)
-    m.on_schedule_end(STEP)
-    assert m.index.num_open_leases == 0
+    assert lookups(manager, b, full_keys) == [LookupResult.HIT] * 4
+    assert (
+        lookups(manager, b, swa_keys)
+        == [LookupResult.MISS] * 6 + [LookupResult.HIT] * 2
+    )
+    spec = manager.prepare_load(full_keys[2:] + swa_keys[6:], b)
+    # 2 FULL positions + 1 SWA slot, the very slot the store used
+    assert list(spec.block_ids) == list(out.store_spec.block_ids[2:4]) + [
+        out.store_spec.block_ids[4]
+    ]
+    manager.complete_load(full_keys[2:] + swa_keys[6:], b)
+    manager.on_schedule_end(STEP)
+    assert manager.index.num_open_leases == 0
 
 
-def test_groups_do_not_alias_in_the_shared_tree(hybrid_manager):
-    m = hybrid_manager
-    hashes = block_hashes(3)
-    store(m, req_context("a", hashes), keys_for(hashes, group_idx=1))
+@pytest.mark.parametrize("regions", [HYBRID], indirect=True)
+def test_swa_publish_waits_for_the_full_path(manager):
+    """SWA slots hang on FULL positions: if the FULL chunks land later, the SWA
+    publish is retried when they do."""
+    hashes = block_hashes(4)
+    ctx = req_context("a", hashes)
+    full_keys, swa_keys = hybrid_keys(hashes)
+    swa_out = manager.prepare_store(swa_keys[2:], ctx)
+    full_out = manager.prepare_store(full_keys, ctx)
+    manager.complete_store(swa_out.keys_to_store, ctx)  # FULL not there yet
     b = req_context("b", hashes)
-    assert lookups(m, b, keys_for(hashes, group_idx=0)) == [LookupResult.MISS] * 3
-    m.on_schedule_end(STEP)
+    assert lookups(manager, b, swa_keys[2:]) == [LookupResult.MISS] * 2
+    manager.on_schedule_end(STEP)
+    manager.complete_store(full_out.keys_to_store, ctx)  # retries the SWA publish
+    assert lookups(manager, b, full_keys + swa_keys[2:]) == [LookupResult.HIT] * 4
+    manager.on_schedule_end(STEP)
+
+
+@pytest.mark.parametrize("regions", [HYBRID], indirect=True)
+def test_swa_slot_is_published_only_when_every_sub_chunk_landed(manager):
+    hashes = block_hashes(4)
+    ctx = req_context("a", hashes)
+    full_keys, swa_keys = hybrid_keys(hashes)
+    store(manager, ctx, full_keys)
+    # only the second half of position 1 arrives (chunk 3 without chunk 2)
+    out = manager.prepare_store([swa_keys[3]], ctx)
+    manager.complete_store(out.keys_to_store, ctx)
+    b = req_context("b", hashes)
+    assert manager.lookup(swa_keys[3], b) is LookupResult.MISS
+    manager.on_schedule_end(STEP)
+    # the other half completes the slot; both chunks are now a hit
+    out = manager.prepare_store([swa_keys[2]], ctx)
+    assert list(out.store_spec.block_ids) == [] or len(out.store_spec.block_ids) == 1
+    manager.complete_store(out.keys_to_store, ctx)
+    assert lookups(manager, b, swa_keys[2:]) == [LookupResult.HIT] * 2
+    manager.on_schedule_end(STEP)
+
+
+@pytest.mark.parametrize("regions", [HYBRID], indirect=True)
+def test_hit_boundary_needs_both_full_and_swa(manager):
+    """A longer FULL prefix without its SWA window is not a hit past the window."""
+    hashes = block_hashes(8)
+    ctx = req_context("a", hashes)
+    full_keys, swa_keys = hybrid_keys(hashes)
+    store(manager, ctx, full_keys + swa_keys[2:4])  # SWA window at position 1 only
+    b = req_context("b", hashes)
+    # common_hit stops where SWA is available: 2 positions
+    assert (
+        lookups(manager, b, full_keys)
+        == [LookupResult.HIT] * 2 + [LookupResult.MISS] * 2
+    )
+    assert (
+        lookups(manager, b, swa_keys)
+        == [LookupResult.MISS] * 2 + [LookupResult.HIT] * 2 + [LookupResult.MISS] * 4
+    )
+    manager.on_schedule_end(STEP)
 
 
 # ------------------------------------------------------------------ resources
 
 
-@pytest.mark.parametrize("regions", [{"background_evict_ratio": 0}], indirect=True)
+@pytest.mark.parametrize(
+    "regions", [{"extra": {"background_evict_ratio": 0}}], indirect=True
+)
 def test_allocation_failure_when_everything_is_pinned(regions):
     """With the background evictor off, a fully pinned pool refuses to allocate."""
-    m = RadixShmemOffloadingManager(regions, [FULL])
-    n = regions.geometry.num_slots
+    m = RadixShmemOffloadingManager(regions, regions.geometry)
+    n = regions.geometry.require_pool(PoolKind.FULL).num_slots
     hashes = block_hashes(n)
     store(m, req_context("a", hashes), keys_for(hashes))
     b = req_context("b", hashes)
@@ -290,7 +353,7 @@ def test_allocation_failure_when_everything_is_pinned(regions):
 
 
 def test_release_all_returns_reserved_slots(regions):
-    m = RadixShmemOffloadingManager(regions, [FULL])
+    m = RadixShmemOffloadingManager(regions, regions.geometry)
     baseline = regions.client.mempool_used()
     hashes = block_hashes(4)
     ctx = req_context("a", hashes)
@@ -319,8 +382,8 @@ def test_stats_report_shared_pool_usage(manager):
 def test_two_schedulers_share_one_region(regions):
     """What one scheduler process publishes is a hit for another, no RPC."""
     peer_regions = attach_regions(regions.geometry, timeout_s=30, role="peer")
-    owner = RadixShmemOffloadingManager(regions, [FULL])
-    peer = RadixShmemOffloadingManager(peer_regions, [FULL])
+    owner = RadixShmemOffloadingManager(regions, regions.geometry)
+    peer = RadixShmemOffloadingManager(peer_regions, peer_regions.geometry)
     try:
         hashes = block_hashes(4)
         store(owner, req_context("a", hashes), keys_for(hashes))

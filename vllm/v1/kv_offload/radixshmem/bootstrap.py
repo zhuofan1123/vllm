@@ -2,10 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Bootstrap of the node-shared RadixShmem regions.
 
-The DP rank 0 scheduler process owns both regions: it derives the geometry from
+Exactly one process on the node owns both regions: it derives the geometry from
 config (see ``geometry.py``), creates the radix index and the SlotStore, and then
-publishes a sentinel file. Every other process -- the remaining DP schedulers and
-all TP workers -- waits for that sentinel, attaches, and fails closed if its own
+publishes a sentinel file. Every other process -- the remaining DP schedulers,
+all TP workers, and the schedulers/workers of *other vLLM instances* that share
+the cache -- waits for that sentinel, attaches, and fails closed if its own
 geometry disagrees with the published one.
 
 The sentinel is what makes the handshake safe:
@@ -16,13 +17,19 @@ The sentinel is what makes the handshake safe:
   so an old mapping stays alive but points at different memory);
 * it carries the geometry, so attachers compare against what the owner actually
   built rather than re-deriving and hoping.
+
+Ownership is decided under a file lock (``<sentinel>.lock``) so two instances
+starting at the same time cannot both create: the second one blocks, then sees
+the first one's live sentinel and attaches instead.
 """
 
 import atexit
 import contextlib
+import fcntl
 import json
 import os
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -37,7 +44,9 @@ from .geometry import (
 
 logger = init_logger(__name__)
 
-SENTINEL_VERSION = 2
+SENTINEL_VERSION = 3
+
+SHM_ROLES = ("auto", "owner", "attach")
 
 
 def _import_shmradix() -> tuple[Any, Any]:
@@ -46,7 +55,7 @@ def _import_shmradix() -> tuple[Any, Any]:
         from shmradix import _data as shmradix_data
     except ImportError as e:
         raise RuntimeError(
-            "RadixShmemConnector requires the `shmradix` package (with its "
+            "RadixShmem offloading requires the `shmradix` package (with its "
             "`_data` extension) on PYTHONPATH. Build RadixShmem and add "
             "<RadixShmem>/python to PYTHONPATH."
         ) from e
@@ -70,6 +79,19 @@ def _region_file(name: str, hugepage_path: str) -> str:
 def _unlink_quiet(path: str) -> None:
     with contextlib.suppress(OSError):
         os.unlink(path)
+
+
+@contextlib.contextmanager
+def _ownership_lock(sentinel: str) -> Iterator[None]:
+    """Serialize the create-or-attach decision across processes on the node."""
+    fd = os.open(f"{sentinel}.lock", os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 
 @dataclass
@@ -96,12 +118,16 @@ class SharedRegions:
         self.client = None
         self.server = None
 
+    def data_view(self) -> memoryview:
+        """Writable view over the whole registerable data range (slot 0..N)."""
+        return self.store.data_view()
+
     @property
     def data_ptr(self) -> int:
         """Address of slot 0 in this process (the registerable range)."""
         import numpy as np
 
-        return np.frombuffer(self.store.data_view(), dtype=np.uint8).ctypes.data
+        return np.frombuffer(self.data_view(), dtype=np.uint8).ctypes.data
 
 
 def _make_shm_config(geometry: SlotGeometry, extra: dict[str, Any]) -> Any:
@@ -114,11 +140,73 @@ def _make_shm_config(geometry: SlotGeometry, extra: dict[str, Any]) -> Any:
     cfg = shmradix.ShmConfig()
     cfg.max_nodes = max_nodes
     cfg.max_blocks = geometry.num_slots
-    cfg.block_size = geometry.offloaded_block_size
+    cfg.block_size = geometry.tokens_per_chunk
     cfg.hugepage_path = geometry.hugepage_path
     if "data_pool_ratio" in extra:
         cfg.data_pool_ratio = float(extra["data_pool_ratio"])
+    if "background_evict_ratio" in extra:
+        # free fraction the index's background evictor keeps; 0 disables it
+        cfg.background_evict_ratio = float(extra["background_evict_ratio"])
     return cfg
+
+
+def open_regions(
+    geometry: SlotGeometry,
+    extra: dict[str, Any],
+    *,
+    shm_role: str = "auto",
+    prefer_owner: bool,
+    role: str,
+    sentinel_dir: str = DEFAULT_SENTINEL_DIR,
+    timeout_s: float = DEFAULT_ATTACH_TIMEOUT_S,
+    check_block_hashes: bool = False,
+) -> SharedRegions:
+    """Create or attach, according to ``shm_role``.
+
+    ``auto`` (default): attach if a live owner already published this region,
+    otherwise create when ``prefer_owner`` (the DP rank 0 scheduler of an
+    instance) or wait for a creator when not (other DP ranks). ``owner`` /
+    ``attach`` force one path; ``owner`` refuses to steal a live region unless
+    ``force_reclaim`` is set in ``extra``.
+    """
+    if shm_role not in SHM_ROLES:
+        raise ValueError(f"shm_role must be one of {SHM_ROLES}, got {shm_role!r}")
+    force_reclaim = bool(extra.get("force_reclaim", False))
+
+    if shm_role == "owner":
+        return create_regions(
+            geometry, extra, sentinel_dir=sentinel_dir, force_reclaim=force_reclaim
+        )
+    if shm_role == "attach" or not prefer_owner:
+        return attach_regions(
+            geometry,
+            sentinel_dir=sentinel_dir,
+            timeout_s=timeout_s,
+            role=role,
+            check_block_hashes=check_block_hashes,
+        )
+
+    sentinel = sentinel_path(geometry, sentinel_dir)
+    with _ownership_lock(sentinel):
+        existing = _read_sentinel(sentinel)
+        live_owner = existing is not None and _pid_alive(int(existing["pid"]))
+        if not live_owner:
+            return create_regions(
+                geometry, extra, sentinel_dir=sentinel_dir, force_reclaim=False
+            )
+    logger.info(
+        "RadixShmem %s: regions %s already owned by pid %s, attaching",
+        role,
+        geometry.data_shm_name,
+        existing["pid"] if existing else "?",
+    )
+    return attach_regions(
+        geometry,
+        sentinel_dir=sentinel_dir,
+        timeout_s=timeout_s,
+        role=role,
+        check_block_hashes=check_block_hashes,
+    )
 
 
 def create_regions(
@@ -138,7 +226,8 @@ def create_regions(
             f"RadixShmem: {sentinel} already claims regions "
             f"{geometry.index_shm_name} / {geometry.data_shm_name}, owned by "
             f"live pid {existing['pid']}. Another vLLM instance is using these "
-            "names; pick different index_shm_name/data_shm_name or stop it."
+            "names; pick different index_shm_name/data_shm_name, use "
+            "shm_role=auto/attach to share them, or stop it."
         )
 
     # Stale leftovers: unlink before create so nothing maps the old region.
@@ -177,16 +266,18 @@ def create_regions(
 
     logger.info(
         "RadixShmem owner ready: index=%s (max_blocks=%d, max_nodes=%d, "
-        "block_size=%d) data=%s (%d slots x %d B stride = %.2f GiB, "
-        "created in %.1fs) sentinel=%s",
+        "tokens_per_chunk=%d) data=%s (%d slots x %d B stride = %.2f GiB, "
+        "%d slice(s) of %d B per slot, created in %.1fs) sentinel=%s",
         geometry.index_shm_name,
         geometry.num_slots,
         shm_cfg.max_nodes,
-        geometry.offloaded_block_size,
+        geometry.tokens_per_chunk,
         geometry.data_shm_name,
         geometry.num_slots,
         geometry.slot_stride,
         geometry.total_data_bytes / 2**30,
+        geometry.num_slices,
+        geometry.slice_bytes,
         create_s,
         sentinel,
     )
@@ -212,9 +303,9 @@ def attach_regions(
     deadline = time.monotonic() + timeout_s
 
     published, owner_pid, owner_none_hash = _wait_for_sentinel(sentinel, deadline, role)
-    geometry.check_same(published, what="the DP rank 0 owner")
+    geometry.check_same(published, what="the region owner")
     if check_block_hashes:
-        check_none_hash(owner_none_hash, what="the DP rank 0 owner")
+        check_none_hash(owner_none_hash, what="the region owner")
 
     client = _retry_until(
         lambda: shmradix.RadixClient(geometry.index_shm_name),
@@ -276,10 +367,10 @@ def _check_attached(geometry: SlotGeometry, client: Any, store: Any) -> None:
             f"index mempool has {mempool_total} slots, SlotStore has "
             f"{geometry.num_slots}; slot ids would run off the data region"
         )
-    if client.block_size() != geometry.offloaded_block_size:
+    if client.block_size() != geometry.tokens_per_chunk:
         raise GeometryMismatch(
             f"index block_size is {client.block_size()} tokens, geometry says "
-            f"{geometry.offloaded_block_size}"
+            f"{geometry.tokens_per_chunk}"
         )
     if geometry.hugepage_path and not store.is_hugepage:
         raise GeometryMismatch(
@@ -292,9 +383,10 @@ def none_hash_fingerprint() -> str | None:
     """vLLM's ``NONE_HASH``, the root every BlockHash chain hangs off.
 
     ``init_none_hash`` seeds it from ``os.urandom`` for xxhash when
-    ``PYTHONHASHSEED`` is unset, so two DP schedulers then hash identical tokens
+    ``PYTHONHASHSEED`` is unset, so two schedulers then hash identical tokens
     to different BlockHashes -- the shared tree silently degenerates into one
-    private subtree per rank. Returns None before the engine has initialized it.
+    private subtree per process. Returns None before the engine has
+    initialized it.
     """
     from vllm.v1.core import kv_cache_utils
 
@@ -310,10 +402,10 @@ def check_none_hash(published: str | None, *, what: str) -> None:
     raise GeometryMismatch(
         "RadixShmem: this process derives a different vLLM NONE_HASH than "
         f"{what} ({local[:16]}... vs {published[:16]}...), so identical tokens "
-        "would hash to different BlockHashes and no prefix could ever be shared "
-        "between DP ranks. With xxhash NONE_HASH is randomized per process "
-        "unless PYTHONHASHSEED is set -- set it to the same fixed value in every "
-        "process that attaches this region, or use sha256."
+        "would hash to different BlockHashes and no prefix could ever be shared. "
+        "With xxhash NONE_HASH is randomized per process unless PYTHONHASHSEED "
+        "is set -- set it to the same fixed value in every process that attaches "
+        "this region, or use --prefix-caching-hash-algo sha256."
     )
 
 
@@ -365,7 +457,7 @@ def _wait_for_sentinel(
         now = time.monotonic()
         if now > deadline:
             raise TimeoutError(
-                f"RadixShmem: {role} timed out waiting for {path}. The DP rank 0 "
+                f"RadixShmem: {role} timed out waiting for {path}. The owning "
                 "scheduler is responsible for creating it; check its logs."
             )
         if now > next_log:

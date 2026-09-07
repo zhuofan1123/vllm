@@ -995,9 +995,14 @@ class VllmConfig:
                 {"cpu_bytes_to_use": kv_offloading_size * (1 << 30)}
             )
         elif kv_offloading_backend == "radixshmem":
-            # node-wide, not per rank: every DP rank maps this one pool
-            self.kv_transfer_config.kv_connector = "RadixShmemConnector"
-            self.kv_transfer_config.kv_connector_extra_config.setdefault(
+            # The native connector with the RadixShmem spec: one shared-memory
+            # pool and prefix index for every DP rank (and every instance on
+            # the node pointing at the same shm names). The budget is
+            # node-wide, not per rank, so it is not divided by world_size.
+            self.kv_transfer_config.kv_connector = "OffloadingConnector"
+            extra_config = self.kv_transfer_config.kv_connector_extra_config
+            extra_config.setdefault("spec_name", "RadixShmemOffloadingSpec")
+            extra_config.setdefault(
                 "cpu_bytes_to_use", int(kv_offloading_size * (1 << 30))
             )
         elif kv_offloading_backend == "lmcache":

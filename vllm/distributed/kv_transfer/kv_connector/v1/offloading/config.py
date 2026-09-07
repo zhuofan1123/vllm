@@ -15,6 +15,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SlidingWindowMLASpec,
     SlidingWindowSpec,
+    is_full_attention_spec,
     iter_layer_specs,
 )
 from vllm.v1.kv_offload.config import (
@@ -49,6 +50,7 @@ def build_offloading_config(
                 parallel_config.decode_context_parallel_size,
             ),
             layer_names=tuple(group.layer_names),
+            is_full_attention=is_full_attention_spec(group.kv_cache_spec),
         )
         for group in kv_cache_config.kv_cache_groups
     )
@@ -205,6 +207,7 @@ def build_offloading_config(
         cache=OffloadingCacheConfig(
             tokens_per_hash=tokens_per_hash,
             blocks_per_chunk=blocks_per_chunk,
+            prefix_caching_hash_algo=vllm_config.cache_config.prefix_caching_hash_algo,
         ),
         parallel=OffloadingParallelConfig(
             rank=parallel_config.rank,

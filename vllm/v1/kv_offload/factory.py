@@ -67,3 +67,8 @@ OffloadingSpecFactory.register_spec(
     "vllm.v1.kv_offload.tiering.spec",
     "TieringOffloadingSpec",
 )
+OffloadingSpecFactory.register_spec(
+    "RadixShmemOffloadingSpec",
+    "vllm.v1.kv_offload.radixshmem.spec",
+    "RadixShmemOffloadingSpec",
+)

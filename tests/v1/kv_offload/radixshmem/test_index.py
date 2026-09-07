@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""The scheduler-side RadixShmem ledger, against a real shared index."""
+"""The ``RadixIndex`` ledger over a real shared index (CPU only)."""
 
 import contextlib
 import os
@@ -8,10 +8,7 @@ import os
 import numpy as np
 import pytest
 
-from vllm.v1.kv_offload.radixshmem.manager import (
-    RadixShmemManager,
-    to_u64,
-)
+from vllm.v1.kv_offload.radixshmem.manager import RadixIndex, to_u64
 
 shmradix = pytest.importorskip("shmradix")
 
@@ -30,7 +27,7 @@ def manager(request):
     cfg.block_size = BLOCK_SIZE
     server = shmradix.RadixServer(name, cfg)
     client = shmradix.RadixClient(server)
-    m = RadixShmemManager(client, offloaded_block_size=BLOCK_SIZE)
+    m = RadixIndex(client)
     yield m
     m.close()
     del client, server
@@ -42,7 +39,7 @@ def hashes(*ids: int) -> np.ndarray:
     return np.array(ids, dtype=np.uint64)
 
 
-def store(m: RadixShmemManager, h: np.ndarray, start: int = 0):
+def store(m: RadixIndex, h: np.ndarray, start: int = 0):
     """Allocate + publish the tail of ``h`` starting at block ``start``."""
     slots = m.allocate(int(h.size) - start)
     assert slots is not None
@@ -65,6 +62,15 @@ def test_to_u64_is_little_endian_prefix():
 
 def test_to_u64_empty():
     assert to_u64([]).shape == (0,)
+
+
+def test_to_u64_folds_the_group_index():
+    h = [bytes(range(32))]
+    assert to_u64(h, 0)[0] == to_u64(h)[0]
+    assert to_u64(h, 1)[0] != to_u64(h)[0]
+    assert to_u64(h, 1)[0] != to_u64(h, 2)[0]
+    # deterministic, so every process derives the same keys
+    assert to_u64(h, 3)[0] == to_u64(h, 3)[0]
 
 
 # ------------------------------------------------------------------- basic flow
@@ -216,7 +222,7 @@ def test_publish_rejected_when_prefix_vanished(manager):
     published, unused = manager.publish(ext, slots, start=3)  # blocks 0..2 absent
     assert published == 0
     assert unused.size == 2
-    assert manager.num_insert_rejected == 1
+    assert manager.num_publish_rejected == 1
     assert manager.client.mempool_used() == used_before
     assert manager.lookup(ext) == 0
 

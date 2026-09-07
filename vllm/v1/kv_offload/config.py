@@ -14,6 +14,11 @@ class OffloadingGroupConfig:
     tokens_per_block: int
     # Layer names belonging to this group.
     layer_names: tuple[str, ...]
+    # False for groups whose blocks are dropped as the request advances
+    # (sliding window, chunked local attention, Mamba states): only a
+    # trailing window of them is ever offloaded, so backends that key by
+    # prefix cannot chain their chunks.
+    is_full_attention: bool = True
 
 
 @dataclass(frozen=True)
@@ -30,6 +35,8 @@ class OffloadingCacheConfig:
     tokens_per_hash: int
     # Blocks coalesced into one offload chunk.
     blocks_per_chunk: int
+    # Prefix-caching hash algorithm name (e.g. "sha256", "xxhash").
+    prefix_caching_hash_algo: str = "sha256"
 
 
 @dataclass(frozen=True)

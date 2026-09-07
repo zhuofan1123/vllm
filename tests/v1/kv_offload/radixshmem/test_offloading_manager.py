@@ -1,0 +1,332 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""``RadixShmemOffloadingManager`` against a real shared index (CPU only).
+
+Drives the ``OffloadingManager`` contract the way the upstream offloading
+connector scheduler does: per-key lookups, ``prepare_load`` / ``complete_load``
+around a load, ``prepare_store`` / ``complete_store`` around a store, and the
+``on_schedule_end`` sweep between steps.
+"""
+
+import numpy as np
+import pytest
+
+from vllm.v1.kv_offload.base import (
+    LookupResult,
+    ScheduleEndContext,
+    make_offload_key,
+)
+from vllm.v1.kv_offload.radixshmem.bootstrap import attach_regions, create_regions
+from vllm.v1.kv_offload.radixshmem.manager import (
+    GroupInfo,
+    RadixShmemOffloadingManager,
+)
+
+from .utils import (
+    block_hashes,
+    geometry_for,
+    keys_for,
+    make_offloading_config,
+    req_context,
+    unique_tag,
+)
+
+STEP = ScheduleEndContext(new_req_ids=(), preempted_req_ids=())
+FULL = GroupInfo(group_idx=0, hashes_per_chunk=1, windowed=False)
+SWA = GroupInfo(group_idx=1, hashes_per_chunk=1, windowed=True)
+
+
+@pytest.fixture
+def regions(request):
+    extra = getattr(request, "param", None) or {}
+    config = make_offloading_config(tag=unique_tag(request), tp_size=2, extra=extra)
+    r = create_regions(geometry_for(config), dict(config.extra_config))
+    yield r
+    r.close()
+
+
+@pytest.fixture
+def manager(regions):
+    m = RadixShmemOffloadingManager(regions, [FULL])
+    yield m
+    m.release_all()
+    m.index.close()
+
+
+def store(manager, ctx, keys, *, success=True):
+    """prepare_store -> (workers copy) -> complete_store; returns the slots."""
+    out = manager.prepare_store(keys, ctx)
+    assert out is not None
+    manager.complete_store(out.keys_to_store, ctx, success=success)
+    return out
+
+
+def lookups(manager, ctx, keys):
+    return [manager.lookup(k, ctx) for k in keys]
+
+
+# --------------------------------------------------------------------- store/hit
+
+
+def test_store_then_hit_from_another_request(manager):
+    hashes = block_hashes(4)
+    a = req_context("a", hashes)
+    manager.on_new_request(a)
+    keys = keys_for(hashes)
+    assert lookups(manager, a, keys) == [LookupResult.MISS] * 4
+    manager.on_schedule_end(STEP)
+
+    out = store(manager, a, keys)
+    assert out.keys_to_store == keys
+    assert len(out.store_spec.block_ids) == 4
+
+    b = req_context("b", hashes)
+    manager.on_new_request(b)
+    assert lookups(manager, b, keys) == [LookupResult.HIT] * 4
+    # one root-anchored query per step answers every key of the request:
+    # a's miss lookup, the store's already-published probe, b's hit lookup
+    assert manager.index.num_queries == 3
+    manager.on_schedule_end(STEP)
+
+
+def test_prefix_hit_stops_at_divergence(manager):
+    hashes = block_hashes(4)
+    a = req_context("a", hashes)
+    store(manager, a, keys_for(hashes))
+
+    other = hashes[:2] + block_hashes(2, salt=9)
+    b = req_context("b", other)
+    assert lookups(manager, b, keys_for(other)) == [
+        LookupResult.HIT,
+        LookupResult.HIT,
+        LookupResult.MISS,
+        LookupResult.MISS,
+    ]
+    manager.on_schedule_end(STEP)
+
+
+def test_second_store_skips_what_a_peer_published(manager):
+    hashes = block_hashes(4)
+    store(manager, req_context("a", hashes), keys_for(hashes))
+    used = manager.index.client.mempool_used()
+    out = manager.prepare_store(keys_for(hashes), req_context("b", hashes))
+    assert out is not None and out.keys_to_store == []
+    assert manager.index.client.mempool_used() == used
+
+
+def test_partial_overlap_stores_only_the_tail(manager):
+    hashes = block_hashes(4)
+    store(manager, req_context("a", hashes[:2]), keys_for(hashes[:2]))
+    out = store(manager, req_context("b", hashes), keys_for(hashes))
+    assert out.keys_to_store == keys_for(hashes)[2:]
+    c = req_context("c", hashes)
+    assert lookups(manager, c, keys_for(hashes)) == [LookupResult.HIT] * 4
+    manager.on_schedule_end(STEP)
+
+
+def test_failed_store_returns_its_slots(manager):
+    hashes = block_hashes(3)
+    ctx = req_context("a", hashes)
+    used = manager.index.client.mempool_used()
+    store(manager, ctx, keys_for(hashes), success=False)
+    assert manager.index.client.mempool_used() == used
+    b = req_context("b", hashes)
+    assert manager.lookup(keys_for(hashes)[0], b) is LookupResult.MISS
+
+
+def test_store_is_not_visible_before_complete_store(manager):
+    hashes = block_hashes(2)
+    ctx = req_context("a", hashes)
+    out = manager.prepare_store(keys_for(hashes), ctx)
+    b = req_context("b", hashes)
+    assert manager.lookup(keys_for(hashes)[0], b) is LookupResult.MISS
+    manager.on_schedule_end(STEP)
+    manager.complete_store(out.keys_to_store, ctx)
+    assert manager.lookup(keys_for(hashes)[0], b) is LookupResult.HIT
+    manager.on_schedule_end(STEP)
+
+
+def test_keys_foreign_to_the_request_are_misses(manager):
+    hashes = block_hashes(2)
+    ctx = req_context("a", hashes)
+    stranger = make_offload_key(block_hashes(1, salt=5)[0], 0)
+    assert manager.lookup(stranger, ctx) is LookupResult.MISS
+    out = manager.prepare_store([stranger], ctx)
+    assert out is not None and out.keys_to_store == []
+
+
+# ------------------------------------------------------------------- load pins
+
+
+def test_load_pins_until_complete_load(manager):
+    hashes = block_hashes(4)
+    store(manager, req_context("a", hashes), keys_for(hashes))
+    stored_slots = list(manager.prepare_load([], req_context("x", [])).block_ids)
+    assert stored_slots == []
+
+    b = req_context("b", hashes)
+    keys = keys_for(hashes)
+    assert lookups(manager, b, keys) == [LookupResult.HIT] * 4
+    # GPU already has the first two chunks: load only the tail
+    spec = manager.prepare_load(keys[2:], b)
+    assert len(spec.block_ids) == 2
+    manager.on_schedule_end(STEP)  # sweep must not drop the load's pin
+    assert manager.index.num_open_leases == 1
+
+    # a full-pool churn cannot evict what the load still reads
+    for gen in range(1, 40):
+        filler = block_hashes(16, salt=100 + gen)
+        out = manager.prepare_store(keys_for(filler), req_context(f"f{gen}", filler))
+        if out is None:
+            break
+        manager.complete_store(out.keys_to_store, req_context(f"f{gen}", filler))
+    c = req_context("c", hashes)
+    assert lookups(manager, c, keys) == [LookupResult.HIT] * 4
+    manager.on_schedule_end(STEP)
+
+    manager.complete_load(keys[2:], b)
+    assert manager.index.num_open_leases == 0
+
+
+def test_load_slots_match_the_stored_slots(manager):
+    hashes = block_hashes(4)
+    out = store(manager, req_context("a", hashes), keys_for(hashes))
+    b = req_context("b", hashes)
+    keys = keys_for(hashes)
+    lookups(manager, b, keys)
+    spec = manager.prepare_load(keys[1:], b)
+    assert list(spec.block_ids) == list(out.store_spec.block_ids[1:])
+    manager.complete_load(keys[1:], b)
+    manager.on_schedule_end(STEP)
+
+
+def test_unused_lookup_pins_are_swept_at_step_end(manager):
+    hashes = block_hashes(4)
+    store(manager, req_context("a", hashes), keys_for(hashes))
+    b = req_context("b", hashes)
+    lookups(manager, b, keys_for(hashes))
+    assert manager.index.num_open_leases == 1
+    manager.on_schedule_end(STEP)
+    assert manager.index.num_open_leases == 0
+    # the next step re-queries from scratch
+    assert lookups(manager, b, keys_for(hashes)) == [LookupResult.HIT] * 4
+    assert manager.index.num_open_leases == 1
+    manager.on_request_finished(b)
+    assert manager.index.num_open_leases == 0
+
+
+def test_hashes_growing_between_steps_extend_the_path(manager):
+    hashes = block_hashes(6)
+    live = list(hashes[:3])
+    ctx = req_context("a", live)
+    keys = keys_for(hashes)
+    assert lookups(manager, ctx, keys[:3]) == [LookupResult.MISS] * 3
+    manager.on_schedule_end(STEP)
+    live.extend(hashes[3:])  # the request decoded three more blocks
+    out = store(manager, ctx, keys)
+    assert out.keys_to_store == keys
+    b = req_context("b", hashes)
+    assert lookups(manager, b, keys) == [LookupResult.HIT] * 6
+    manager.on_schedule_end(STEP)
+
+
+# --------------------------------------------------------------- windowed group
+
+
+@pytest.fixture
+def hybrid_manager(regions):
+    m = RadixShmemOffloadingManager(regions, [FULL, SWA])
+    yield m
+    m.release_all()
+    m.index.close()
+
+
+def test_windowed_group_stores_flat_and_hits_per_key(hybrid_manager):
+    m = hybrid_manager
+    hashes = block_hashes(6)
+    a = req_context("a", hashes)
+    full_keys = keys_for(hashes, group_idx=0)
+    swa_keys = keys_for(hashes, group_idx=1)
+    # the connector stores the full group whole but only the SWA tail
+    store(m, a, full_keys + swa_keys[4:])
+
+    b = req_context("b", hashes)
+    assert lookups(m, b, full_keys) == [LookupResult.HIT] * 6
+    assert lookups(m, b, swa_keys) == [LookupResult.MISS] * 4 + [LookupResult.HIT] * 2
+    spec = m.prepare_load(full_keys[2:] + swa_keys[4:], b)
+    assert len(spec.block_ids) == 6
+    m.complete_load(full_keys[2:] + swa_keys[4:], b)
+    m.on_schedule_end(STEP)
+    assert m.index.num_open_leases == 0
+
+
+def test_groups_do_not_alias_in_the_shared_tree(hybrid_manager):
+    m = hybrid_manager
+    hashes = block_hashes(3)
+    store(m, req_context("a", hashes), keys_for(hashes, group_idx=1))
+    b = req_context("b", hashes)
+    assert lookups(m, b, keys_for(hashes, group_idx=0)) == [LookupResult.MISS] * 3
+    m.on_schedule_end(STEP)
+
+
+# ------------------------------------------------------------------ resources
+
+
+@pytest.mark.parametrize("regions", [{"background_evict_ratio": 0}], indirect=True)
+def test_allocation_failure_when_everything_is_pinned(regions):
+    """With the background evictor off, a fully pinned pool refuses to allocate."""
+    m = RadixShmemOffloadingManager(regions, [FULL])
+    n = regions.geometry.num_slots
+    hashes = block_hashes(n)
+    store(m, req_context("a", hashes), keys_for(hashes))
+    b = req_context("b", hashes)
+    assert lookups(m, b, keys_for(hashes)) == [LookupResult.HIT] * n  # pins all
+    more = block_hashes(1, salt=7)
+    assert m.prepare_store(keys_for(more), req_context("c", more)) is None
+    m.on_schedule_end(STEP)
+    assert m.prepare_store(keys_for(more), req_context("c", more)) is not None
+    m.release_all()
+    m.index.close()
+
+
+def test_release_all_returns_reserved_slots(regions):
+    m = RadixShmemOffloadingManager(regions, [FULL])
+    baseline = regions.client.mempool_used()
+    hashes = block_hashes(4)
+    ctx = req_context("a", hashes)
+    out = m.prepare_store(keys_for(hashes), ctx)
+    assert out is not None and regions.client.mempool_used() == baseline + 4
+    m.release_all()  # a crash here would leak those slots for the region's life
+    assert regions.client.mempool_used() == baseline
+    m.index.close()
+
+
+def test_stats_report_shared_pool_usage(manager):
+    hashes = block_hashes(3)
+    store(manager, req_context("a", hashes), keys_for(hashes))
+    stats = manager.get_stats()
+    reduced = stats.reduce()
+    assert reduced["vllm:kv_offload_radixshmem_slots_used"] >= 3
+    assert reduced["vllm:kv_offload_radixshmem_published_blocks"] == 3
+
+
+def test_two_schedulers_share_one_region(regions):
+    """What one scheduler process publishes is a hit for another, no RPC."""
+    peer_regions = attach_regions(regions.geometry, timeout_s=30, role="peer")
+    owner = RadixShmemOffloadingManager(regions, [FULL])
+    peer = RadixShmemOffloadingManager(peer_regions, [FULL])
+    try:
+        hashes = block_hashes(4)
+        store(owner, req_context("a", hashes), keys_for(hashes))
+        ctx = req_context("b", hashes)
+        assert lookups(peer, ctx, keys_for(hashes)) == [LookupResult.HIT] * 4
+        spec = peer.prepare_load(keys_for(hashes), ctx)
+        assert np.array_equal(spec.block_ids, np.asarray(spec.block_ids))
+        peer.complete_load(keys_for(hashes), ctx)
+        peer.on_schedule_end(STEP)
+    finally:
+        peer.release_all()
+        peer.index.close()
+        owner.release_all()
+        owner.index.close()
+        peer_regions.close()

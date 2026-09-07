@@ -62,6 +62,44 @@ vllm serve <model> \
   }'
 ```
 
+## Node-Shared Offloading With RadixShmem
+
+`RadixShmemOffloadingSpec` replaces the per-engine CPU pool with one
+shared-memory pool and one shared radix prefix index for the whole node. Every
+DP rank -- and every vLLM instance on the node that points at the same
+shared-memory names -- attaches the same regions, so a prefix offloaded by any of
+them is a hit for all of them without any RPC. It needs the `shmradix` package
+(RadixShmem with its `_data` extension) on `PYTHONPATH`.
+
+```bash
+vllm serve MODEL --kv-offloading-backend radixshmem --kv-offloading-size 100
+```
+
+`--kv-offloading-size` is the budget for the whole node, not per rank. The first
+scheduler to start creates the regions and publishes a sentinel under
+`/dev/shm`; later schedulers and all workers attach and refuse to run if their
+geometry (model, TP size, chunking) differs. Two independent instances share a
+cache simply by using the same names, which is the default.
+
+RadixShmem-specific keys in `kv_connector_extra_config` (the generic keys above
+still apply; `spec_name` is set for you):
+
+| Key | Default | Notes |
+| --- | --- | --- |
+| `index_shm_name` / `data_shm_name` | `/vllm_kv_index` / `/vllm_kv_data` | Change both to run two independent caches on one host. |
+| `shm_role` | `auto` | `auto` attaches to a live owner and otherwise creates; `owner` / `attach` force one path. |
+| `replicated_kv` | vLLM's detection | Store one TP slice instead of `tp_size` when every rank holds identical KV bytes (MLA / MQA models). |
+| `slot_align` | `4096` | Slot stride alignment in bytes (power of two). |
+| `hugepage_path` | — | Back the data region with hugetlbfs mounted here. |
+| `max_nodes` / `data_pool_ratio` | derived | Sizing of the shared radix index. |
+| `background_evict_ratio` | `0.05` | Free fraction of the pool the index's background evictor keeps available; `0` disables it (allocation then evicts on demand only). |
+| `sentinel_dir` / `attach_timeout_s` | `/dev/shm` / `300` | Where the readiness sentinel lives and how long attachers wait for it. |
+| `force_reclaim` | `false` | With `shm_role=owner`, take over regions whose sentinel names a live pid. |
+
+Limits: `PP=1`, no context parallelism, single node, and `reset_prefix_cache`
+does not clear the shared index. With `--prefix-caching-hash-algo xxhash`,
+set the same `PYTHONHASHSEED` in every process or nothing can be shared.
+
 ## `kv_connector_extra_config` Reference
 
 | Key | Required | Default | Scope | Notes |

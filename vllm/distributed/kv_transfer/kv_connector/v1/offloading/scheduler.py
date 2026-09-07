@@ -487,6 +487,7 @@ def _create_req_context(req: Request) -> ReqContext:
         req_id=req.request_id,
         kv_transfer_params=params,
         load_tier_filter=load_filter,
+        block_hashes=req.block_hashes,
     )
 
 

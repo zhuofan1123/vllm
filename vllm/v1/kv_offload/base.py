@@ -92,6 +92,9 @@ class ReqContext:
     req_id: str
     kv_transfer_params: dict[str, Any] | None = None
     load_tier_filter: TierFilter = TierFilter.ALL
+    # The request's block hashes (hash_block_size granularity, growing as the
+    # request runs), for managers that index by prefix rather than by key.
+    block_hashes: Sequence[bytes] | None = None
     # Per-request scratch space keyed by value type, so a tier can parse
     # kv_transfer_params once (in on_new_request) and read the result back
     # on later calls for the same request.

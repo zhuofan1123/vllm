@@ -44,11 +44,22 @@ def _group_layer_specs(
 
 
 def _sliding_window_tokens(spec: KVCacheSpec) -> int | None:
-    if isinstance(spec, SlidingWindowSpec):
-        return spec.sliding_window
-    if isinstance(spec, ChunkedLocalAttentionSpec):
-        return spec.attention_chunk_size
-    return None
+    """Attention span of a windowed group, looking through the uniform-type
+    wrapper (DeepSeek-V4's SWA layers arrive wrapped); None if not windowed."""
+    windows: set[int] = set()
+    for layer_spec in iter_layer_specs(spec):
+        if isinstance(layer_spec, SlidingWindowSpec):
+            windows.add(layer_spec.sliding_window)
+        elif isinstance(layer_spec, ChunkedLocalAttentionSpec):
+            windows.add(layer_spec.attention_chunk_size)
+    return max(windows) if windows else None
+
+
+def _is_recurrent(spec: KVCacheSpec) -> bool:
+    layer_specs = iter_layer_specs(spec)
+    return len(layer_specs) > 0 and all(
+        isinstance(layer_spec, MambaSpec) for layer_spec in layer_specs
+    )
 
 
 def _layer_placements(kv_cache_config: "KVCacheConfig") -> dict[str, tuple[int, int]]:
@@ -89,7 +100,7 @@ def build_offloading_config(
             ),
             layer_names=tuple(group.layer_names),
             is_full_attention=is_full_attention_spec(group.kv_cache_spec),
-            is_recurrent=isinstance(group.kv_cache_spec, MambaSpec),
+            is_recurrent=_is_recurrent(group.kv_cache_spec),
             sliding_window_tokens=_sliding_window_tokens(group.kv_cache_spec),
             worker_kv_bytes_per_block=sum(
                 spec.page_size_bytes

@@ -423,11 +423,10 @@ def compute_geometry(config: "OffloadingConfig") -> SlotGeometry:
             )
         )
 
-    # name + KV dtype only: the KV layout string is resolved on workers but not
-    # on schedulers, and the byte layout is checked separately anyway
-    fingerprint = hashlib.sha256(
-        f"{config.model.name}|{config.model.dtype}".encode()
-    ).hexdigest()[:16]
+    # model name only: KV dtype ("auto" -> e.g. fp8_ds_mla) and layout are
+    # resolved on workers but not on schedulers; the byte layout is published
+    # by the owner and checked against the real tensors separately
+    fingerprint = hashlib.sha256(config.model.name.encode()).hexdigest()[:16]
 
     return SlotGeometry(
         index_shm_name=str(extra.get("index_shm_name", DEFAULT_INDEX_SHM_NAME)),

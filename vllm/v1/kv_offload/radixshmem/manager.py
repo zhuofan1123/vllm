@@ -318,6 +318,7 @@ class RadixIndex:
             "query_ms": round(self.time_query_s * 1e3, 1),
             "alloc_ms": round(self.time_alloc_s * 1e3, 1),
             "insert_ms": round(self.time_insert_s * 1e3, 1),
+            "index_s": self.time_query_s + self.time_alloc_s + self.time_insert_s,
         }
 
     def close(self) -> None:
@@ -754,25 +755,18 @@ class RadixShmemOffloadingManager(OffloadingManager):
         stats.set_gauge(RadixShmemMetrics.SLOTS_USED, current["used_slots"])
         stats.set_gauge(RadixShmemMetrics.SLOTS_TOTAL, current["num_slots"])
         stats.set_gauge(RadixShmemMetrics.OPEN_LEASES, current["open_leases"])
+        # Prometheus rejects negative counter increments, so every delta is
+        # clamped: the fields are monotonic, but float rounding is not.
         for name, field_name in (
             (RadixShmemMetrics.HIT_BLOCKS, "hit_blocks"),
             (RadixShmemMetrics.PUBLISHED_BLOCKS, "published"),
             (RadixShmemMetrics.PUBLISH_REJECTED, "publish_rejected"),
             (RadixShmemMetrics.ALLOC_FAILURES, "alloc_failures"),
+            (RadixShmemMetrics.INDEX_TIME, "index_s"),
         ):
             delta = current[field_name] - previous[field_name]
-            if delta:
+            if delta > 0:
                 stats.increase_counter(name, delta)
-        index_ms = (
-            current["query_ms"]
-            + current["alloc_ms"]
-            + current["insert_ms"]
-            - previous["query_ms"]
-            - previous["alloc_ms"]
-            - previous["insert_ms"]
-        )
-        if index_ms:
-            stats.increase_counter(RadixShmemMetrics.INDEX_TIME, index_ms * 1e-3)
         return stats
 
     def release_all(self) -> None:

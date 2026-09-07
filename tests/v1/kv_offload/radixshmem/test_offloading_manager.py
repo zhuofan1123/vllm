@@ -308,6 +308,12 @@ def test_stats_report_shared_pool_usage(manager):
     reduced = stats.reduce()
     assert reduced["vllm:kv_offload_radixshmem_slots_used"] >= 3
     assert reduced["vllm:kv_offload_radixshmem_published_blocks"] == 3
+    assert reduced["vllm:kv_offload_radixshmem_index_time"] > 0
+    # deltas are counters: never negative, even with no activity in between
+    for _ in range(50):
+        for key, value in manager.get_stats().reduce().items():
+            if not key.endswith(("slots_used", "slots_total", "open_leases")):
+                assert value >= 0, (key, value)
 
 
 def test_two_schedulers_share_one_region(regions):

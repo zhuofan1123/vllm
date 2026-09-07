@@ -268,8 +268,8 @@ def create_regions(
 
     store_cfg = shmradix_data.SlotStoreConfig()
     store_cfg.name = geometry.data_shm_name
-    store_cfg.num_slots = geometry.num_slots
-    store_cfg.slot_bytes = geometry.slot_bytes
+    store_cfg.full.num_slots = geometry.num_slots
+    store_cfg.full.slot_bytes = geometry.slot_bytes
     store_cfg.slot_align = geometry.slot_align
     store_cfg.hugepage_path = geometry.hugepage_path
     store_cfg.prefault = bool(extra.get("prefault", True))
@@ -401,6 +401,12 @@ def _check_attached(geometry: SlotGeometry, client: Any, store: Any) -> None:
             f"index block_size is {client.block_size()} tokens, geometry says "
             f"{geometry.tokens_per_chunk}"
         )
+    # pool by pool: the index's FULL/SWA/MAMBA capacities vs the store's pools
+    shmradix, _ = _import_shmradix()
+    try:
+        shmradix.check_pools_aligned(client, store)
+    except ValueError as e:
+        raise GeometryMismatch(str(e)) from e
     if geometry.hugepage_path and not store.is_hugepage:
         raise GeometryMismatch(
             f"hugepage_path={geometry.hugepage_path!r} was requested but the "

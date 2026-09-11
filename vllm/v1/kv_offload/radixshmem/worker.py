@@ -3,9 +3,9 @@
 """Worker side of RadixShmem offloading.
 
 Nothing is allocated here: the CPU side is one node-wide shared SlotStore that
-the owning scheduler created, and this worker only attaches to it, pins the
-mapping for DMA, and exposes its own slice of every slot as strided int8
-tensors. The transfers themselves are upstream's
+the node's RadixServer created, and this worker only attaches to it (through a
+read-only ``RadixClient``), pins the mapping for DMA, and exposes its own slice
+of every slot as strided int8 tensors. The transfers themselves are upstream's
 ``SingleDirectionOffloadingHandler`` -- batch copies over the same address
 arithmetic the private CPU pool uses, so there is no RadixShmem copy path.
 
@@ -20,7 +20,7 @@ when every part has.
 Attaching is deferred to a background thread started at construction, joined by
 the first transfer. Workers are built during ``initialize_from_config``, before
 any scheduler exists, so attaching eagerly would wait forever on the scheduler
-that creates the regions; doing it inline on the first transfer instead costs
+that starts the server; doing it inline on the first transfer instead costs
 ~1 s per 10 GiB (cudaHostRegister) with the engine step loop stopped.
 """
 
@@ -28,6 +28,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 
@@ -44,7 +45,6 @@ from vllm.v1.kv_offload.base import (
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 from vllm.v1.kv_offload.cpu.gpu_worker import SingleDirectionOffloadingHandler
 
-from .bootstrap import SharedRegions
 from .geometry import (
     GroupLayout,
     PoolKind,
@@ -151,7 +151,7 @@ def plan_groups(
 
 
 def group_cpu_views(
-    regions: SharedRegions, plan: _GroupTensors, writer_idx: int
+    store: Any, geometry: SlotGeometry, plan: _GroupTensors, writer_idx: int
 ) -> tuple[torch.Tensor, list[torch.Tensor]]:
     """Strided per-tensor views of this writer's region of a group's pool.
 
@@ -162,7 +162,7 @@ def group_cpu_views(
     addressed by slot id.
     """
     group = plan.group
-    pool = regions.geometry.require_pool(PoolKind(group.kind))
+    pool = geometry.require_pool(PoolKind(group.kind))
     layout = group_tensor_layout(group, plan.page_bytes)
     verify_group_layout(pool, group, layout)
     if not 0 <= writer_idx < pool.num_slices:
@@ -170,7 +170,7 @@ def group_cpu_views(
             f"writer index {writer_idx} out of range for {pool.num_slices} "
             "slice(s) per slot"
         )
-    base = torch.frombuffer(regions.pool_view(pool.kind), dtype=torch.int8)
+    base = torch.frombuffer(store.pool_view(int(pool.kind)), dtype=torch.int8)
     if base.numel() < pool.num_slots * pool.slot_stride:
         raise RuntimeError(
             f"{PoolKind(pool.kind).name} pool mapping is {base.numel()} B, geometry "
@@ -203,13 +203,14 @@ class RadixShmemOffloadingWorker(OffloadingWorker):
     def __init__(
         self,
         *,
-        attach: Callable[[], tuple[SharedRegions, int]],
+        attach: Callable[[], tuple[Any, SlotGeometry, int]],
         kv_caches: CanonicalKVCaches,
     ):
+        # attach() -> (read-only RadixClient, adopted geometry, tp rank)
         self._attach = attach
         self._kv_caches = kv_caches
 
-        self.regions: SharedRegions | None = None
+        self.client: Any = None
         self.tp_rank: int | None = None
         self._data_base: torch.Tensor | None = None
         self._registered_ptr: int | None = None
@@ -241,11 +242,11 @@ class RadixShmemOffloadingWorker(OffloadingWorker):
         with self._attach_lock:
             if self._groups is not None:
                 return
-            regions, tp_rank = self._attach()
-            geometry = regions.geometry
+            client, geometry, tp_rank = self._attach()
+            store = client.store
             writer_idx = 0 if geometry.replicated else tp_rank
 
-            data_base = torch.frombuffer(regions.data_view(), dtype=torch.int8)
+            data_base = torch.frombuffer(store.data_view(), dtype=torch.int8)
             t0 = time.perf_counter()
             host_register(data_base.data_ptr(), data_base.numel())
             register_s = time.perf_counter() - t0
@@ -255,7 +256,9 @@ class RadixShmemOffloadingWorker(OffloadingWorker):
             for plan in plan_groups(geometry, self._kv_caches):
                 if not plan.gpu_tensors:
                     continue
-                cpu_base, cpu_tensors = group_cpu_views(regions, plan, writer_idx)
+                cpu_base, cpu_tensors = group_cpu_views(
+                    store, geometry, plan, writer_idx
+                )
                 common = dict(
                     gpu_tensors=plan.gpu_tensors,
                     cpu_tensors=cpu_tensors,
@@ -268,7 +271,7 @@ class RadixShmemOffloadingWorker(OffloadingWorker):
                     store=SingleDirectionOffloadingHandler(gpu_to_cpu=True, **common),
                     load=SingleDirectionOffloadingHandler(gpu_to_cpu=False, **common),
                 )
-            self.regions = regions
+            self.client = client
             self.tp_rank = tp_rank
             self._data_base = data_base
             # published last: this is what _ensure_attached checks
@@ -449,6 +452,6 @@ class RadixShmemOffloadingWorker(OffloadingWorker):
             host_unregister(self._registered_ptr)
             self._registered_ptr = None
         self._data_base = None
-        if self.regions is not None:
-            self.regions.close()
-            self.regions = None
+        if self.client is not None:
+            self.client.close()
+            self.client = None

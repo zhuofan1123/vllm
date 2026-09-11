@@ -32,12 +32,17 @@ cache group maps onto positions of that path (see ``geometry.py``):
 SWA and MAMBA publishes need the FULL path below them, so a completed store
 publishes FULL first; anything the index rejects for a missing path is retried
 on later completions.
+
+Across nodes, a request whose local hit is short is deferred (``RETRY``) while
+``RadixClient.pull_async`` pulls the peer's slots into this node's store and
+publishes them; the next step's ordinary local lookup then simply hits.
 """
 
 import time
 from collections import defaultdict
 from collections.abc import Collection, Iterable
 from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
 
@@ -67,6 +72,26 @@ logger = init_logger(__name__)
 
 # a FULL_PATH_MISSING publish is retried on this many later completions
 _MAX_PUBLISH_RETRIES = 64
+
+# per-request remote pull lifecycle (see RadixShmemOffloadingManager.lookup)
+_P2P_NONE = 0
+_P2P_INFLIGHT = 1
+_P2P_DONE = 2
+
+
+@dataclass(frozen=True)
+class RemoteFetchPolicy:
+    """When a request whose local hit is short pulls the rest from a peer node."""
+
+    min_blocks: int = 2  # smallest gap past the local hit worth a pull
+    timeout_ms: int = 30_000
+
+    @classmethod
+    def from_extra(cls, extra: dict[str, Any]) -> "RemoteFetchPolicy":
+        return cls(
+            min_blocks=max(1, int(extra.get("remote_lookup_min_blocks", 2))),
+            timeout_ms=int(float(extra.get("p2p_fetch_timeout_s", 30.0)) * 1000),
+        )
 
 
 class RadixShmemMetrics:
@@ -478,6 +503,10 @@ class _ReqState:
     # this step's pinned lookup, None once handed to a load or when nothing hit
     lease: LookupLease | None = None
     looked_up: bool = False
+    # remote pull lifecycle for this admission: _P2P_NONE / _INFLIGHT / _DONE;
+    # spans steps (unlike ``lease``), so a deferred request pulls once
+    p2p: int = _P2P_NONE
+    job: Any = None  # the in-flight shmradix PullJob
     # pins that back an in-flight load; released in complete_load
     load_leases: list[LookupLease] = field(default_factory=list)
 
@@ -518,14 +547,27 @@ class RadixShmemOffloadingManager(OffloadingManager):
 
     def __init__(
         self,
-        regions,
+        client,
         geometry: SlotGeometry,
         *,
         enable_events: bool = False,
+        server=None,
+        remote: RemoteFetchPolicy | None = None,
     ):
-        self.regions = regions
+        self.client = client
+        # the in-process RadixServer, when this scheduler started the node's
+        self.server = server
         self.geometry = geometry
-        self.index = RadixIndex(regions.client, mask=geometry.pool_mask)
+        self.index = RadixIndex(client, mask=geometry.pool_mask)
+        # remote pulls need peers to pull from and a data plane to land in
+        self._remote = (
+            remote
+            if remote is not None and client.is_distributed() and client.info.data_plane
+            else None
+        )
+        self._inflight = 0
+        self.num_remote_jobs = 0
+        self.num_remote_blocks = 0
         self.groups: dict[int, GroupLayout] = {g.group_idx: g for g in geometry.groups}
         full = [g for g in geometry.groups if g.kind == PoolKind.FULL]
         self._full_groups = frozenset(g.group_idx for g in full)
@@ -606,6 +648,8 @@ class RadixShmemOffloadingManager(OffloadingManager):
 
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
         state = self._state(req_context)
+        if state.job is not None:
+            self._collect_remote(state)
         located = self._locate(state, req_context, key)
         if located is None:
             # not derived from this request's hashes (e.g. a boundary key of a
@@ -614,26 +658,88 @@ class RadixShmemOffloadingManager(OffloadingManager):
         group, position, _ = located
         self._dirty.add(req_context.req_id)
         lease = self._round_lease(state)
-        if lease is None:
-            return LookupResult.MISS
+        local_hit = lease.hit_blocks if lease is not None else 0
         if group.kind == PoolKind.FULL:
-            return (
-                LookupResult.HIT if position < lease.hit_blocks else LookupResult.MISS
-            )
+            if position < local_hit:
+                return LookupResult.HIT
+            return self._p2p_beyond_hit(state, local_hit)
         if group.kind == PoolKind.SWA:
             # a windowed group hits on its own window, independent of the FULL
             # prefix depth (the connector loads only the window)
-            return (
-                LookupResult.HIT
-                if lease.swa_slot(position) is not None
-                else LookupResult.MISS
-            )
+            if lease is not None and lease.swa_slot(position) is not None:
+                return LookupResult.HIT
+            return self._p2p_beyond_hit(state, local_hit)
         # MAMBA: only the checkpoint at its own hit boundary is usable
-        return (
-            LookupResult.HIT
-            if lease.mamba_slot is not None and position == lease.mamba_position
-            else LookupResult.MISS
+        if (
+            lease is not None
+            and lease.mamba_slot is not None
+            and position == lease.mamba_position
+        ):
+            return LookupResult.HIT
+        return self._p2p_beyond_hit(state, local_hit)
+
+    def _p2p_beyond_hit(self, state: _ReqState, local_hit: int) -> LookupResult:
+        """A key past the local hit: defer while a peer pull runs, else miss.
+
+        The first beyond-hit lookup of a request whose gap is worth a pull hands
+        the path to ``RadixClient.pull_async`` and defers (``RETRY``): the server
+        reads the peer's slots into this node's store and the client publishes
+        them. Once that resolves, the next step's ordinary local lookup is a
+        plain ``HIT`` and the load goes through the unchanged worker.
+        """
+        if self._remote is None:
+            return LookupResult.MISS
+        if state.p2p == _P2P_INFLIGHT:
+            return LookupResult.RETRY
+        if state.p2p == _P2P_DONE:
+            return LookupResult.MISS
+        if int(state.path.size) - local_hit < self._remote.min_blocks:
+            return LookupResult.MISS
+        job = self._submit_remote(state.path)
+        self.num_remote_jobs += 1
+        if job.planned_hit <= job.local_hit:
+            # no peer holds more than this node, or the client is saturated
+            job.wait(0)
+            state.p2p = _P2P_DONE
+            return LookupResult.MISS
+        state.job = job
+        state.p2p = _P2P_INFLIGHT
+        self._inflight += 1
+        return LookupResult.RETRY
+
+    def _submit_remote(self, path: np.ndarray):
+        # one combined-mask pull: for a hybrid model a FULL prefix the windowed
+        # groups cannot cover is of no use to the request anyway
+        return self.client.pull_async(
+            path,
+            mask=self.geometry.pool_mask,
+            lock=False,
+            timeout_ms=self._remote.timeout_ms,
+            block=False,
         )
+
+    def _collect_remote(self, state: _ReqState) -> None:
+        """Finish the request's pull once it is done.
+
+        Drops this step's lease so the next lookup re-pins with the promoted
+        prefix included.
+        """
+        job = state.job
+        if not job.done():
+            return
+        result = job.wait(0)
+        result.finalize()
+        state.job = None
+        state.p2p = _P2P_DONE
+        self._inflight -= 1
+        self.num_remote_blocks += int(result.remote_blocks)
+        state.release_round()
+
+    def _cancel_remote(self, state: _ReqState) -> None:
+        if state.job is not None:
+            state.job.cancel()
+            state.job = None
+            self._inflight -= 1
 
     def touch(self, keys: Collection[OffloadKey], req_context: ReqContext) -> None:
         """Refresh the LRU position of the request's path."""
@@ -889,6 +995,7 @@ class RadixShmemOffloadingManager(OffloadingManager):
         self._dirty.discard(req_context.req_id)
         if state is None:
             return
+        self._cancel_remote(state)
         state.release_round()
         # load pins stay until complete_load: a copy may still be in flight
 
@@ -899,7 +1006,9 @@ class RadixShmemOffloadingManager(OffloadingManager):
         return events
 
     def has_pending_work(self) -> bool:
-        return False
+        # keep the engine stepping so a request deferred on an in-flight pull
+        # is asked again once the pull resolves
+        return self._inflight > 0
 
     def reset_cache(self) -> None:
         # The index is shared with other schedulers and instances; one engine's
@@ -938,6 +1047,7 @@ class RadixShmemOffloadingManager(OffloadingManager):
         the shared region lives -- which outlives this process.
         """
         for state in self._states.values():
+            self._cancel_remote(state)
             state.release_all()
         self._states.clear()
         self._dirty.clear()
@@ -952,5 +1062,19 @@ class RadixShmemOffloadingManager(OffloadingManager):
     def shutdown(self) -> None:
         self.release_all()
         logger.info("RadixShmem index stats: %s", self.index.stats())
+        if self._remote is not None:
+            logger.info(
+                "RadixShmem remote pulls: jobs=%d promoted_blocks=%d "
+                "transfer_failures=%d staging_shortfalls=%d "
+                "promotion_shortfalls=%d saturated=%d",
+                self.num_remote_jobs,
+                self.num_remote_blocks,
+                self.client.transfer_failures,
+                self.client.staging_shortfalls,
+                self.client.promotion_shortfalls,
+                self.client.saturated,
+            )
         self.index.close()
-        self.regions.close()
+        self.client.close()
+        if self.server is not None:
+            self.server.close()

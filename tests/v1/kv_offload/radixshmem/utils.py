@@ -20,6 +20,7 @@ from vllm.v1.kv_offload.config import (
     OffloadingModelConfig,
     OffloadingParallelConfig,
 )
+from vllm.v1.kv_offload.radixshmem.bootstrap import open_client
 from vllm.v1.kv_offload.radixshmem.geometry import SlotGeometry, compute_geometry
 
 pytest.importorskip("shmradix")
@@ -72,11 +73,11 @@ def make_offloading_config(
     """
     extra_config: dict[str, Any] = {
         "spec_name": "RadixShmemOffloadingSpec",
-        "index_shm_name": f"/rs_t_idx_{tag}",
-        "data_shm_name": f"/rs_t_dat_{tag}",
+        "name": f"/rs_t_{tag}",
         "cpu_bytes_to_use": cpu_bytes,
         "slot_align": 4096,
         "attach_timeout_s": 60,
+        "prefault": False,
     }
     if extra:
         extra_config.update(extra)
@@ -120,6 +121,21 @@ def hybrid_groups() -> list[OffloadingGroupConfig]:
 
 def geometry_for(config: OffloadingConfig) -> SlotGeometry:
     return compute_geometry(config)
+
+
+def open_test_client(
+    config: OffloadingConfig, *, may_start: bool = True, read_only: bool = False
+):
+    """``(client, server)`` for ``config``: the first caller per name starts the
+    node's RadixServer in this process, later callers attach to it."""
+    return open_client(
+        compute_geometry(config),
+        dict(config.extra_config),
+        role="test",
+        may_start=may_start,
+        read_only=read_only,
+        timeout_s=30,
+    )
 
 
 def unique_tag(request) -> str:

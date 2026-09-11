@@ -3,9 +3,10 @@
 """Slot geometry for the RadixShmem shared KV cache.
 
 Everything here is derivable from ``OffloadingConfig``, i.e. before any KV
-tensor exists. That is what lets the owning scheduler create the shared regions
-and every other process (other DP schedulers, all TP workers, other vLLM
-instances on the node) attach to them and fail closed on any disagreement.
+tensor exists. That is what lets the scheduler that starts the node's
+RadixServer size it, and every other process (other DP schedulers, all TP
+workers, other vLLM instances on the node) check the server's published slot
+geometry against its own and fail closed on any disagreement.
 
 RadixShmem's SlotStore is one shared region split into up to three pools --
 FULL, SWA, MAMBA -- each with its own slot size, matching the index's three
@@ -33,8 +34,7 @@ so from one TP rank's point of view canonical tensor ``t`` of a pool is a stride
 ``kv_offload/cpu`` expects, so the transfer path is upstream's, unchanged.
 """
 
-import hashlib
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass, replace
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any
 
@@ -43,11 +43,8 @@ from vllm.utils.math_utils import cdiv
 if TYPE_CHECKING:
     from vllm.v1.kv_offload.config import OffloadingConfig
 
-DEFAULT_INDEX_SHM_NAME = "/vllm_kv_index"
-DEFAULT_DATA_SHM_NAME = "/vllm_kv_data"
 DEFAULT_SLOT_ALIGN = 4096
 DEFAULT_ATTACH_TIMEOUT_S = 300.0
-DEFAULT_SENTINEL_DIR = "/dev/shm"
 
 
 class PoolKind(IntEnum):
@@ -116,10 +113,6 @@ class PoolSpec:
 class SlotGeometry:
     """Fully-resolved geometry of the shared index + SlotStore."""
 
-    index_shm_name: str
-    data_shm_name: str
-    hugepage_path: str
-
     # tokens per FULL chunk; also the index's block_size
     tokens_per_chunk: int
     blocks_per_chunk: int
@@ -133,10 +126,6 @@ class SlotGeometry:
     groups: tuple[GroupLayout, ...]
     # present pools only, in PoolKind order
     pools: tuple[PoolSpec, ...]
-
-    # model identity: a region holds one model's KV, and two models with the
-    # same byte layout would otherwise attach to each other's cache
-    model_fingerprint: str = ""
 
     # ----------------------------------------------------------- accessors
 
@@ -164,82 +153,55 @@ class SlotGeometry:
     def total_data_bytes(self) -> int:
         return sum(p.num_slots * p.slot_stride for p in self.pools)
 
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+    def adopt(self, client: Any) -> "SlotGeometry":
+        """Take slot counts and strides from the server ``client`` is attached to.
 
-    @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "SlotGeometry":
-        d = dict(d)
-        d["groups"] = tuple(
-            GroupLayout(
-                **{**g, "layer_pages": tuple(tuple(lp) for lp in g["layer_pages"])}
-            )
-            for g in d["groups"]
-        )
-        d["pools"] = tuple(PoolSpec(**p) for p in d["pools"])
-        return cls(**d)
-
-    # fields a process can derive identically from its own config even when it
-    # sees a projected KV cache config (workers do): everything but byte counts
-    _COMPATIBILITY_FIELDS = (
-        "index_shm_name",
-        "data_shm_name",
-        "hugepage_path",
-        "tokens_per_chunk",
-        "blocks_per_chunk",
-        "tp_size",
-        "replicated",
-        "slot_align",
-        "model_fingerprint",
-    )
-
-    def check_compatible(self, published: "SlotGeometry", *, what: str) -> None:
-        """Fail closed unless ``published`` describes the same deployment.
-
-        Workers see the KV cache config after worker-side projection (kernel
-        block splitting, padded pages), so their recomputed byte counts need
-        not equal the scheduler's; they adopt the published geometry instead
-        and only the structural fields must agree.
+        The server decides how many slots each pool has and how wide a slot is
+        (``client.geometry``, and the attached store's real stride); this
+        process keeps its own layout inside the slot. Fails closed if the
+        chunking differs, a needed pool is missing, the SWA window differs or
+        a slot is too narrow for this model's bytes.
         """
-        mine, theirs = self.to_dict(), published.to_dict()
-        diffs = [
-            f"{k}: mine={mine[k]!r} theirs={theirs.get(k)!r}"
-            for k in self._COMPATIBILITY_FIELDS
-            if mine[k] != theirs.get(k)
-        ]
-        if self.pool_mask != published.pool_mask:
+        published = client.geometry
+        store = client.store
+        names = {PoolKind.FULL: "full", PoolKind.SWA: "swa", PoolKind.MAMBA: "mamba"}
+        diffs: list[str] = []
+        if int(published["block_size"]) != self.tokens_per_chunk:
             diffs.append(
-                f"pools: mine={self.pool_mask:#x} theirs={published.pool_mask:#x}"
+                f"tokens per chunk: server={published['block_size']} "
+                f"mine={self.tokens_per_chunk}"
             )
-        for a, b in zip(self.groups, published.groups):
-            for k in ("group_idx", "kind", "tokens_per_chunk", "ratio"):
-                if getattr(a, k) != getattr(b, k):
-                    diffs.append(
-                        f"group {a.group_idx} {k}: mine={getattr(a, k)!r} "
-                        f"theirs={getattr(b, k)!r}"
-                    )
-        if len(self.groups) != len(published.groups):
-            diffs.append(
-                f"groups: mine={len(self.groups)} theirs={len(published.groups)}"
+        pools: list[PoolSpec] = []
+        for p in self.pools:
+            kind = PoolKind(p.kind)
+            srv = published["pools"].get(names[kind])
+            if srv is None:
+                diffs.append(f"{kind.name} pool: server has none")
+                continue
+            stride = int(store.pool(int(kind)).slot_bytes)
+            if stride < p.slot_bytes:
+                diffs.append(
+                    f"{kind.name} slot: server={stride} B, this model needs "
+                    f"{p.slot_bytes} B"
+                )
+            if kind == PoolKind.SWA and (
+                int(srv.get("window_blocks", 0)) != self.swa_window_blocks
+            ):
+                diffs.append(
+                    f"SWA window: server={srv.get('window_blocks')} "
+                    f"mine={self.swa_window_blocks}"
+                )
+            pools.append(
+                replace(p, num_slots=int(srv["num_slots"]), slot_stride=stride)
             )
         if diffs:
             raise GeometryMismatch(
-                f"RadixShmem geometry is incompatible with {what}: " + "; ".join(diffs)
+                "RadixShmem: the server's slot geometry does not fit this model "
+                "(another model or configuration owns it): " + "; ".join(diffs)
             )
-
-    def check_same(self, other: "SlotGeometry", *, what: str) -> None:
-        """Fail closed if any field differs from what ``what`` published."""
-        mine = self.to_dict()
-        theirs = other.to_dict()
-        diffs = [
-            f"{k}: mine={mine[k]!r} theirs={theirs.get(k)!r}"
-            for k in mine
-            if mine[k] != theirs.get(k)
-        ]
-        if diffs:
-            raise GeometryMismatch(
-                f"RadixShmem geometry disagrees with {what}: " + "; ".join(diffs)
-            )
+        return replace(
+            self, slot_align=int(published["slot_align"]), pools=tuple(pools)
+        )
 
 
 def _parse_bool(value: Any, name: str) -> bool:
@@ -423,15 +385,7 @@ def compute_geometry(config: "OffloadingConfig") -> SlotGeometry:
             )
         )
 
-    # model name only: KV dtype ("auto" -> e.g. fp8_ds_mla) and layout are
-    # resolved on workers but not on schedulers; the byte layout is published
-    # by the owner and checked against the real tensors separately
-    fingerprint = hashlib.sha256(config.model.name.encode()).hexdigest()[:16]
-
     return SlotGeometry(
-        index_shm_name=str(extra.get("index_shm_name", DEFAULT_INDEX_SHM_NAME)),
-        data_shm_name=str(extra.get("data_shm_name", DEFAULT_DATA_SHM_NAME)),
-        hugepage_path=str(extra.get("hugepage_path", "")),
         tokens_per_chunk=tokens_per_chunk,
         blocks_per_chunk=blocks_per_chunk,
         swa_window_blocks=swa_window_blocks,
@@ -440,7 +394,6 @@ def compute_geometry(config: "OffloadingConfig") -> SlotGeometry:
         slot_align=slot_align,
         groups=tuple(groups),
         pools=tuple(pools),
-        model_fingerprint=fingerprint,
     )
 
 

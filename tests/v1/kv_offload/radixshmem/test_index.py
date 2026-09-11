@@ -21,12 +21,13 @@ def manager(request):
     name = f"/rs_mgr_{os.getpid()}_{abs(hash(request.node.name)) % 10**6}"
     with contextlib.suppress(OSError):
         os.unlink(f"/dev/shm{name}")
-    cfg = shmradix.ShmConfig()
+    # the bare index (no server process, no store): RadixIndex needs nothing else
+    cfg = shmradix._core.ShmConfig()
     cfg.max_nodes = 4 * NUM_SLOTS + 1024
     cfg.max_blocks = NUM_SLOTS
     cfg.block_size = BLOCK_SIZE
-    server = shmradix.RadixServer(name, cfg)
-    client = shmradix.RadixClient(server)
+    server = shmradix._core.RadixServer(name, cfg)
+    client = shmradix._core.RadixClient(server)
     m = RadixIndex(client)
     yield m
     m.close()

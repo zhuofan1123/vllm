@@ -3,14 +3,16 @@
 """``OffloadingSpec`` for a node-shared CPU KV cache backed by RadixShmem.
 
 Every DP rank -- and every vLLM instance on the node that points at the same
-shared-memory names -- shares one radix index *and* one slot store, so a prefix
+server name -- shares one radix index *and* one slot store, so a prefix
 offloaded by any of them is a real cache hit for all of them. This is the
 difference from ``CPUOffloadingSpec``, where each engine keeps a private pool.
+With the server configured as a cluster member, a prefix held by another node
+is pulled over RDMA and becomes a local hit too.
 
-Bootstrap: the first scheduler to start (DP rank 0 of the first instance)
-derives the geometry from config, creates both shared regions, and publishes a
-sentinel; every other scheduler and every TP worker waits for that sentinel and
-attaches, refusing to run if its own geometry disagrees.
+Bootstrap: the first scheduler to get there starts the node's ``RadixServer``
+in-process, sized from the geometry it derives from config; every other
+scheduler and every TP worker connects to it as a ``RadixClient``, adopts the
+slot counts it published, and refuses to run if its own slot shape does not fit.
 
 The SlotStore has one pool per attention kind (FULL / SWA / MAMBA), sized from
 the KV cache groups; SWA and Mamba chunks go through the index's own components
@@ -20,20 +22,23 @@ Selected with ``--kv-offloading-backend radixshmem``; ``--kv-offloading-size``
 is then the budget for the *whole node*, not per rank or per instance. Optional
 knobs in ``kv_connector_extra_config``:
 
-* ``index_shm_name`` / ``data_shm_name``: change both to run two independent
-  caches on one host;
-* ``shm_role``: ``auto`` (default: attach to a live owner, else create),
-  ``owner`` or ``attach``;
+* ``name`` / ``endpoint``: the server's name (its shm and socket names derive
+  from it; change it to run two independent caches on one host) and, for TCP,
+  its gRPC endpoint;
 * ``replicated_kv``: store one TP slice instead of ``tp_size`` when every rank
   holds identical KV bytes (MLA / MQA models); defaults to vLLM's detection;
 * ``full_slots`` / ``swa_slots`` / ``mamba_slots``: slot counts per pool;
-  unset pools get as many slots as the FULL pool within ``cpu_bytes_to_use``;
-* ``block_size`` / ``blocks_per_chunk``, ``slot_align``, ``hugepage_path``,
-  ``max_nodes``, ``data_pool_ratio``, ``background_evict_ratio``,
-  ``sentinel_dir``, ``attach_timeout_s``, ``force_reclaim``, ``prefault``.
+  unset pools split ``cpu_bytes_to_use`` by a default share;
+* ``slot_align``, ``hugepage_path``, ``attach_timeout_s``, and any field of
+  shmradix's ``IndexConfig`` / ``DataPlaneConfig`` / ``ClusterConfig`` under
+  its own name (``prefault``, ``background_evict_ratio``,
+  ``expected_min_nodes``, ``registry``, ``rpc_address``, ``transfer_devices``,
+  ...) for the server this process may start;
+* ``remote_lookup_min_blocks`` / ``p2p_fetch_timeout_s`` /
+  ``max_inflight_fetches``: when and how a short local hit pulls from a peer.
 
-Limits: ``PP=1``, no context parallelism, one node, and ``reset_prefix_cache``
-does not clear the shared index.
+Limits: ``PP=1``, no context parallelism, and ``reset_prefix_cache`` does not
+clear the shared index.
 """
 
 import os
@@ -51,14 +56,13 @@ from vllm.v1.kv_offload.base import (
 )
 from vllm.v1.kv_offload.config import OffloadingConfig
 
-from .bootstrap import SharedRegions, attach_regions, open_regions
-from .geometry import (
-    DEFAULT_ATTACH_TIMEOUT_S,
-    DEFAULT_SENTINEL_DIR,
-    SlotGeometry,
-    compute_geometry,
+from .bootstrap import open_client
+from .geometry import DEFAULT_ATTACH_TIMEOUT_S, SlotGeometry, compute_geometry
+from .manager import (
+    RadixShmemMetrics,
+    RadixShmemOffloadingManager,
+    RemoteFetchPolicy,
 )
-from .manager import RadixShmemMetrics, RadixShmemOffloadingManager
 from .worker import RadixShmemOffloadingWorker
 
 logger = init_logger(__name__)
@@ -128,8 +132,6 @@ class RadixShmemOffloadingSpec(OffloadingSpec):
         self.geometry: SlotGeometry = compute_geometry(config)
         # tells the connector worker that only TP rank 0 needs to store
         self.replicated_layout = self.geometry.replicated
-        self._shm_role = str(extra.get("shm_role", "auto"))
-        self._sentinel_dir = str(extra.get("sentinel_dir", DEFAULT_SENTINEL_DIR))
         self._attach_timeout_s = float(
             extra.get("attach_timeout_s", DEFAULT_ATTACH_TIMEOUT_S)
         )
@@ -139,24 +141,20 @@ class RadixShmemOffloadingSpec(OffloadingSpec):
 
     def get_manager(self) -> OffloadingManager:
         _warn_if_block_hashes_are_per_process(self.config)
-        parallel = self.config.parallel
-        dp_index = parallel.data_parallel_index
-        regions = open_regions(
+        dp_index = self.config.parallel.data_parallel_index
+        client, server = open_client(
             self.geometry,
             self._extra,
-            shm_role=self._shm_role,
-            # dp rank 0 of an instance creates unless a live owner exists;
-            # the other dp ranks always wait for one
-            prefer_owner=(dp_index == 0),
             role=f"dp{dp_index} scheduler ({self.config.engine_id[:8]})",
-            sentinel_dir=self._sentinel_dir,
+            may_start=True,
             timeout_s=self._attach_timeout_s,
-            check_block_hashes=True,
         )
         return RadixShmemOffloadingManager(
-            regions,
-            self.geometry,
+            client,
+            self.geometry.adopt(client),
             enable_events=self.kv_events_config.enable_kv_cache_events,
+            server=server,
+            remote=RemoteFetchPolicy.from_extra(self._extra),
         )
 
     # ------------------------------------------------------------- worker
@@ -164,14 +162,15 @@ class RadixShmemOffloadingSpec(OffloadingSpec):
     def get_worker(self, kv_caches: CanonicalKVCaches) -> OffloadingWorker:
         rank = self.config.parallel.rank
 
-        def attach() -> tuple[SharedRegions, int]:
-            regions = attach_regions(
+        def attach() -> tuple[Any, SlotGeometry, int]:
+            client, _ = open_client(
                 self.geometry,
-                sentinel_dir=self._sentinel_dir,
-                timeout_s=self._attach_timeout_s,
+                self._extra,
                 role=f"tp{rank} worker ({self.config.engine_id[:8]})",
-                adopt_published=True,
+                may_start=False,
+                read_only=True,
+                timeout_s=self._attach_timeout_s,
             )
-            return regions, rank
+            return client, self.geometry.adopt(client), rank
 
         return RadixShmemOffloadingWorker(attach=attach, kv_caches=kv_caches)

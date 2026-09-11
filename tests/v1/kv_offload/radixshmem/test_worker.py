@@ -18,7 +18,6 @@ from vllm.v1.kv_offload.base import (
     GPULoadStoreSpec,
 )
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
-from vllm.v1.kv_offload.radixshmem.bootstrap import attach_regions, create_regions
 from vllm.v1.kv_offload.radixshmem.geometry import PoolKind
 from vllm.v1.kv_offload.radixshmem.worker import (
     RadixShmemOffloadingWorker,
@@ -26,7 +25,13 @@ from vllm.v1.kv_offload.radixshmem.worker import (
     plan_groups,
 )
 
-from .utils import geometry_for, group, make_offloading_config, unique_tag
+from .utils import (
+    geometry_for,
+    group,
+    make_offloading_config,
+    open_test_client,
+    unique_tag,
+)
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
@@ -139,22 +144,25 @@ def run(worker, gpu, cpu, *, store, job_id=0):
 
 class Rig:
     def __init__(self, request, config, make_caches):
-        self.geometry = geometry_for(config)
-        self.owner = create_regions(self.geometry, dict(config.extra_config))
-        self.peer = attach_regions(self.geometry, timeout_s=60, role="tp1")
+        # the server lives in this process; both "ranks" are read-only clients
+        self.owner, self.server = open_test_client(config, read_only=True)
+        self.peer, _ = open_test_client(config, may_start=False, read_only=True)
+        self.geometry = geometry_for(config).adopt(self.owner)
         self.gpu, self.workers = [], []
-        for tp_rank, regions in enumerate((self.owner, self.peer)):
+        for tp_rank, client in enumerate((self.owner, self.peer)):
             tensors, caches = make_caches()
             self.gpu.append(tensors)
             self.workers.append(
                 RadixShmemOffloadingWorker(
-                    attach=lambda r=regions, k=tp_rank: (r, k), kv_caches=caches
+                    attach=lambda c=client, k=tp_rank: (c, self.geometry, k),
+                    kv_caches=caches,
                 )
             )
 
     def close(self):
-        for w in reversed(self.workers):  # the peer detaches before the owner unlinks
+        for w in reversed(self.workers):  # every client detaches before the server
             w.shutdown()
+        self.server.close()
 
 
 @pytest.fixture
@@ -178,7 +186,7 @@ def test_group_views_address_this_ranks_region(rig):
     full = g.require_pool(PoolKind.FULL)
     _, caches = make_kv_caches()
     [plan] = plan_groups(g, caches)
-    base, views = group_cpu_views(rig.owner, plan, writer_idx=1)
+    base, views = group_cpu_views(rig.owner.store, g, plan, writer_idx=1)
     assert len(views) == 2
     for t, v in enumerate(views):
         assert v.shape == (full.num_slots, PAGE_BYTES)

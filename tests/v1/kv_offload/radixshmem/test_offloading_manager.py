@@ -9,6 +9,8 @@ around a load, ``prepare_store`` / ``complete_store`` around a store, and the
 shaped (see ``hybrid_groups``): one SWA slot spans two SWA chunks.
 """
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
@@ -17,7 +19,6 @@ from vllm.v1.kv_offload.base import (
     ScheduleEndContext,
     make_offload_key,
 )
-from vllm.v1.kv_offload.radixshmem.bootstrap import attach_regions, create_regions
 from vllm.v1.kv_offload.radixshmem.geometry import PoolKind
 from vllm.v1.kv_offload.radixshmem.manager import RadixShmemOffloadingManager
 
@@ -27,6 +28,7 @@ from .utils import (
     hybrid_groups,
     keys_for,
     make_offloading_config,
+    open_test_client,
     req_context,
     unique_tag,
 )
@@ -36,6 +38,7 @@ STEP = ScheduleEndContext(new_req_ids=(), preempted_req_ids=())
 
 @pytest.fixture
 def regions(request):
+    """This process's RadixServer plus a client on it, as a scheduler sees them."""
     param = getattr(request, "param", None) or {}
     config = make_offloading_config(
         tag=unique_tag(request),
@@ -43,14 +46,20 @@ def regions(request):
         groups=param.get("groups"),
         extra=param.get("extra"),
     )
-    r = create_regions(geometry_for(config), dict(config.extra_config))
-    yield r
-    r.close()
+    client, server = open_test_client(config)
+    yield SimpleNamespace(
+        config=config,
+        client=client,
+        server=server,
+        geometry=geometry_for(config).adopt(client),
+    )
+    client.close()
+    server.close()
 
 
 @pytest.fixture
 def manager(regions):
-    m = RadixShmemOffloadingManager(regions, regions.geometry)
+    m = RadixShmemOffloadingManager(regions.client, regions.geometry)
     yield m
     m.release_all()
     m.index.close()
@@ -246,15 +255,15 @@ def test_swa_window_is_stored_in_its_own_pool_and_hits_per_position(manager):
     hashes = block_hashes(8)  # 4 FULL positions, 8 SWA chunks
     a = req_context("a", hashes)
     full_keys, swa_keys = hybrid_keys(hashes)
-    swa_before = manager.regions.client.swa_mempool_total()
+    swa_before = manager.client.swa_mempool_total()
     # the connector stores the whole FULL group and the SWA tail window
     # (chunks 6, 7 == position 3)
     out = store(manager, a, full_keys + swa_keys[6:])
     assert out.keys_to_store == full_keys + swa_keys[6:]
     # one CPU slot per (group, position): 4 FULL + 1 SWA
     assert len(out.store_spec.block_ids) == 5
-    assert manager.regions.client.mempool_used() == 4  # FULL pool
-    assert manager.regions.client.swa_mempool_total() == swa_before
+    assert manager.client.mempool_used() == 4  # FULL pool
+    assert manager.client.swa_mempool_total() == swa_before
 
     b = req_context("b", hashes)
     assert lookups(manager, b, full_keys) == [LookupResult.HIT] * 4
@@ -358,7 +367,7 @@ def test_full_prefix_hits_independently_of_the_swa_window(manager):
 )
 def test_allocation_failure_when_everything_is_pinned(regions):
     """With the background evictor off, a fully pinned pool refuses to allocate."""
-    m = RadixShmemOffloadingManager(regions, regions.geometry)
+    m = RadixShmemOffloadingManager(regions.client, regions.geometry)
     n = regions.geometry.require_pool(PoolKind.FULL).num_slots
     hashes = block_hashes(n)
     store(m, req_context("a", hashes), keys_for(hashes))
@@ -373,7 +382,7 @@ def test_allocation_failure_when_everything_is_pinned(regions):
 
 
 def test_release_all_returns_reserved_slots(regions):
-    m = RadixShmemOffloadingManager(regions, regions.geometry)
+    m = RadixShmemOffloadingManager(regions.client, regions.geometry)
     baseline = regions.client.mempool_used()
     hashes = block_hashes(4)
     ctx = req_context("a", hashes)
@@ -401,9 +410,12 @@ def test_stats_report_shared_pool_usage(manager):
 
 def test_two_schedulers_share_one_region(regions):
     """What one scheduler process publishes is a hit for another, no RPC."""
-    peer_regions = attach_regions(regions.geometry, timeout_s=30, role="peer")
-    owner = RadixShmemOffloadingManager(regions, regions.geometry)
-    peer = RadixShmemOffloadingManager(peer_regions, peer_regions.geometry)
+    peer_client, peer_server = open_test_client(regions.config)
+    assert peer_server is None  # a live server was found, none started
+    owner = RadixShmemOffloadingManager(regions.client, regions.geometry)
+    peer = RadixShmemOffloadingManager(
+        peer_client, geometry_for(regions.config).adopt(peer_client)
+    )
     try:
         hashes = block_hashes(4)
         store(owner, req_context("a", hashes), keys_for(hashes))
@@ -418,4 +430,4 @@ def test_two_schedulers_share_one_region(regions):
         peer.index.close()
         owner.release_all()
         owner.index.close()
-        peer_regions.close()
+        peer_client.close()

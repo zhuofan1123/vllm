@@ -65,43 +65,82 @@ vllm serve <model> \
 ## Node-Shared Offloading With RadixShmem
 
 `RadixShmemOffloadingSpec` replaces the per-engine CPU pool with one
-shared-memory pool and one shared radix prefix index for the whole node. Every
-DP rank -- and every vLLM instance on the node that points at the same
-shared-memory names -- attaches the same regions, so a prefix offloaded by any of
-them is a hit for all of them without any RPC. It needs the `shmradix` package
-(RadixShmem with its `_data` extension) on `PYTHONPATH`.
+shared-memory pool and one shared radix prefix index for the whole node, owned
+by a `RadixServer` from the `shmradix` package (RadixShmem with its `_data`
+extension and `grpcio`). Every DP rank -- and every vLLM instance on the node
+that uses the same server name -- is a client of that server, so a prefix
+offloaded by any of them is a hit for all of them without any RPC on the
+lookup path.
 
 ```bash
 vllm serve MODEL --kv-offloading-backend radixshmem --kv-offloading-size 100
 ```
 
-`--kv-offloading-size` is the budget for the whole node, not per rank. The first
-scheduler to start creates the regions and publishes a sentinel under
-`/dev/shm`; later schedulers and all workers attach and refuse to run if their
-geometry (model, TP size, chunking) differs. Two independent instances share a
-cache simply by using the same names, which is the default.
+`--kv-offloading-size` is the budget for the whole node, not per rank. The
+first scheduler to start takes a file lock, finds no server at the name's
+socket (`/dev/shm/<name>.sock`) and starts one in its own process, sized from
+its geometry (slots per pool, bytes per slot, tokens per chunk). Every later
+scheduler and every TP worker connects to it, adopts the slot counts it
+published and refuses to run if its own slot shape does not fit (a different
+model, TP size or chunking). The cache lives as long as the process that
+started the server. Two independent instances share a cache simply by using the
+same name, which is the default.
+
+Run with `--shutdown-timeout 30` (or another positive value): with the default
+of `0` the engine core is force-killed as soon as it receives SIGTERM and never
+reaches the connector shutdown that closes the server, leaving its regions in
+`/dev/shm`. Leftovers of a crashed server are replaced by the next start under
+the same name, or removed by hand:
+
+```bash
+rm -f /dev/shm/NAME /dev/shm/NAME_data /dev/shm/NAME.sock /dev/shm/NAME.vllm.lock
+```
 
 RadixShmem-specific keys in `kv_connector_extra_config` (the generic keys above
 still apply; `spec_name` is set for you):
 
 | Key | Default | Notes |
 | --- | --- | --- |
-| `index_shm_name` / `data_shm_name` | `/vllm_kv_index` / `/vllm_kv_data` | Change both to run two independent caches on one host. |
-| `shm_role` | `auto` | `auto` attaches to a live owner and otherwise creates; `owner` / `attach` force one path. |
+| `name` | `/vllm_kv` | Server name; its shm regions, gRPC socket and lock derive from it. Change it to run two independent caches on one host. |
+| `endpoint` | `unix:///dev/shm/<name>.sock` | gRPC endpoint of the server; set `host:port` for TCP. |
 | `replicated_kv` | vLLM's detection | Store one TP slice instead of `tp_size` when every rank holds identical KV bytes (MLA / MQA models). |
-| `full_slots` / `swa_slots` / `mamba_slots` | derived | Slot count per pool. The store has one pool per attention kind: full-attention groups share FULL slots, sliding-window / chunked-local groups SWA slots (one per full-attention chunk of tokens), Mamba groups MAMBA slots. Unset pools get as many slots as the FULL pool, all within `cpu_bytes_to_use`. |
+| `full_slots` / `swa_slots` / `mamba_slots` | derived | Slot count per pool. The store has one pool per attention kind: full-attention groups share FULL slots, sliding-window / chunked-local groups SWA slots (one per full-attention chunk of tokens), Mamba groups MAMBA slots. Unset pools split `cpu_bytes_to_use` by a default share. |
 | `slot_align` | `4096` | Slot stride alignment in bytes (power of two). |
-| `hugepage_path` | — | Back the data region with hugetlbfs mounted here. |
-| `max_nodes` / `data_pool_ratio` | derived | Sizing of the shared radix index. |
-| `background_evict_ratio` | `0.05` | Free fraction of the pool the index's background evictor keeps available; `0` disables it (allocation then evicts on demand only). |
-| `sentinel_dir` / `attach_timeout_s` | `/dev/shm` / `300` | Where the readiness sentinel lives and how long attachers wait for it. |
-| `force_reclaim` | `false` | With `shm_role=owner`, take over regions whose sentinel names a live pid. |
+| `hugepage_path` | — | Back both regions with hugetlbfs mounted here. |
+| `attach_timeout_s` | `300` | How long a client waits for the server to appear and become ready. |
+| any `IndexConfig` / `DataPlaneConfig` / `ClusterConfig` field | shmradix defaults | Passed by name to the server this process may start: e.g. `prefault`, `background_evict_ratio`, `data_pool_ratio`, `transfer_devices`, and the cluster keys below. |
 
-Limits: `PP=1`, no context parallelism, single node, `reset_prefix_cache`
-does not clear the shared index, and sliding windows wider than one
-full-attention chunk are published one position at a time (only the request's
-final window is loadable). With `--prefix-caching-hash-algo xxhash`,
-set the same `PYTHONHASHSEED` in every process or nothing can be shared.
+Limits: `PP=1`, no context parallelism, `reset_prefix_cache` does not clear
+the shared index, and sliding windows wider than one full-attention chunk are
+published one position at a time (only the request's final window is
+loadable). With `--prefix-caching-hash-algo xxhash`, set the same
+`PYTHONHASHSEED` in every process or nothing can be shared.
+
+### Cross-node sharing
+
+Giving the server a cluster (`expected_min_nodes > 1` plus an etcd `registry`)
+extends sharing across nodes: the servers rendezvous through etcd, a prefix
+stored on another node is found by one distributed query, and its KV is pulled
+over RDMA into this node's store and published in the local index by
+`RadixClient.pull_async`. The pull runs off the scheduler's critical path: a
+request whose local hit is short is deferred (`RETRY`) until the peer prefix is
+local, then loads exactly like a node-local hit. Every node must run the same
+model with the same geometry; the servers cross-check their data planes at
+bootstrap.
+
+| Key | Default | Notes |
+| --- | --- | --- |
+| `expected_min_nodes` | `0` | Number of nodes to wait for at bootstrap; `> 1` selects cluster mode. |
+| `registry` | `etcd://127.0.0.1:2379` | etcd shared by every node. |
+| `cluster_id` / `node_name` | `default` / auto | etcd key namespace and this node's identity (must differ per node). |
+| `rpc_address` / `rpc_interface` | — | Bootstrap bind IP or NIC (one is required; `0.0.0.0` only for several nodes on one host). |
+| `index_dev` / `gid_idx` | first / `3` | Index control-plane RDMA device and RoCE GID index. |
+| `transfer_devices` / `transfer_protocol` / `transfer_ip` | all / `rdma` / `rpc_address` | Data-plane (Mooncake) RDMA device allowlist, transport, and segment address. |
+| `remote_lookup_min_blocks` | `2` | Do not pull from a peer when the gap past the local hit is smaller than this many chunks. |
+| `p2p_fetch_timeout_s` / `max_inflight_fetches` | `30` / `8` | Per-pull timeout and the number of pulls one scheduler keeps in flight. |
+
+Cross-node needs a `shmradix` built with etcd and Mooncake support, an `etcd`
+reachable from every node, and RDMA devices.
 
 ## `kv_connector_extra_config` Reference
 

@@ -45,14 +45,13 @@ def make_scheduler(tag: str) -> OffloadingConnectorScheduler:
     vllm_config = _make_vllm_config(
         extra_config={
             "spec_name": "RadixShmemOffloadingSpec",
-            "index_shm_name": f"/rs_cs_idx_{tag}",
-            "data_shm_name": f"/rs_cs_dat_{tag}",
+            "name": f"/rs_cs_{tag}",
             "cpu_bytes_to_use": 4 << 20,
             "attach_timeout_s": 30,
+            "prefault": False,
         }
     )
     vllm_config.speculative_config = None
-    # part of the model fingerprint; a MagicMock would differ per scheduler
     vllm_config.cache_config.kv_cache_layout = "BLHNC"
     kv_cache_config = _make_kv_cache_config()
     spec = OffloadingSpecFactory.create_spec(
@@ -110,7 +109,7 @@ def ack(scheduler, job_ids):
 def schedulers(request):
     tag = unique_tag(request)
     first = make_scheduler(tag)
-    second = make_scheduler(tag)  # same names -> attaches to the live owner
+    second = make_scheduler(tag)  # same name -> attaches to the first's server
     yield first, second
     second.shutdown()
     first.shutdown()
@@ -119,7 +118,7 @@ def schedulers(request):
 def test_prefix_stored_by_one_scheduler_loads_on_another(schedulers):
     first, second = schedulers
     assert isinstance(first.manager, RadixShmemOffloadingManager)
-    assert first.manager.regions.is_owner and not second.manager.regions.is_owner
+    assert first.manager.server is not None and second.manager.server is None
 
     hashes = block_hashes(4)
     req = make_request("a", hashes)
